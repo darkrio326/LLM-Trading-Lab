@@ -83,6 +83,10 @@ class EastmoneyBroker:
 
     session: wd.Session
 
+    #: BrokerAdapter 通用、非机密身份。execution journal 只记录这个字段，
+    #: 不记录 URL、账号、Cookie、浏览器会话或任何 provider-specific 细节。
+    provider = "eastmoney"
+
     # -- 下单 -------------------------------------------------------------
 
     def place_order(self, order: ValidatedOrder) -> str:

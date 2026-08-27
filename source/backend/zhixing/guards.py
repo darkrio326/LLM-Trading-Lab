@@ -8,8 +8,9 @@
 
     模型产出 ──▶ ProposedOrder ──▶ validate() ──▶ ValidatedOrder ──▶ 下单
 
-``qty`` 和 ``limit_price`` 必须先转成券商调用需要的 ``int`` / ``Decimal``。
-这不是风控判断,只是类型规范化;无法转换时没有可提交的参数,因此会返回失败报告。
+``qty`` 和 ``limit_price`` 必须先转成券商调用需要的 ``int`` / ``Decimal``，
+并且买卖数量和限价必须是正的有限数。这是 execution integrity，不是用传统
+指标二次否决模型；参数无法形成一笔明确订单时没有可提交的 broker request。
 ``ValidatedOrder`` 仍只能由本模块构造,执行层没有第二条旁路。
 """
 
@@ -171,8 +172,12 @@ def _to_int(value: object) -> int | None:
         return None
     if isinstance(value, int):
         return value
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return None
+        return int(value) if value == value.to_integral_value() else None
     if isinstance(value, float):
-        return int(value) if float(value).is_integer() else None
+        return int(value) if value.is_integer() and Decimal(str(value)).is_finite() else None
     if isinstance(value, str):
         text = value.strip().replace(",", "").replace("股", "").replace("份", "")
         if not text:
@@ -180,6 +185,8 @@ def _to_int(value: object) -> int | None:
         try:
             dec = Decimal(text)
         except InvalidOperation:
+            return None
+        if not dec.is_finite():
             return None
         return int(dec) if dec == dec.to_integral_value() else None
     return None
@@ -215,8 +222,9 @@ def _to_decimal(value: object) -> Decimal | None:
 def validate(proposed: ProposedOrder, ctx: ValidationContext) -> GuardReport:
     """规范化一条指令。这是产出 ``ValidatedOrder`` 的**唯一途径**。
 
-    所有风控规则都已移除。买卖指令只做数量和限价的类型转换,并一次报告
-    全部无法转换的字段;撤单不需要数量和价格。
+    所有传统本地交易规则都已移除。买卖指令只检查数量和限价能否形成正的
+    有限 broker 参数，并一次报告全部 execution-integrity 问题；撤单不需要
+    数量和价格。
     """
     failures: list[GuardFailure] = []
 
@@ -231,11 +239,19 @@ def validate(proposed: ProposedOrder, ctx: ValidationContext) -> GuardReport:
             failures.append(
                 GuardFailure("QTY_UNPARSABLE", f"数量无法转换为整数:{proposed.qty!r}")
             )
+        elif parsed_qty <= 0:
+            failures.append(
+                GuardFailure("QTY_NOT_POSITIVE", f"数量必须大于 0:{proposed.qty!r}")
+            )
         else:
             qty = parsed_qty
         if parsed_price is None:
             failures.append(
                 GuardFailure("PRICE_UNPARSABLE", f"限价无法转换为数字:{proposed.limit_price!r}")
+            )
+        elif parsed_price <= 0:
+            failures.append(
+                GuardFailure("PRICE_NOT_POSITIVE", f"限价必须大于 0:{proposed.limit_price!r}")
             )
         else:
             price = parsed_price
@@ -257,14 +273,14 @@ def validate(proposed: ProposedOrder, ctx: ValidationContext) -> GuardReport:
         market=proposed.market,
         symbol=proposed.symbol,
         name=proposed.name,
-        qty=qty or 0,
-        limit_price=price or Decimal("0"),
+        qty=qty,
+        limit_price=price,
         notional=notional,
         wtbh=proposed.wtbh,
         reason=proposed.reason,
         risk_note=proposed.risk_note,
         validated_at=ctx.now,
-        passed=("type_normalization",),
+        passed=("execution_integrity",),
         _token=_GUARD_TOKEN,
     )
     return GuardReport(proposed, order, ())
