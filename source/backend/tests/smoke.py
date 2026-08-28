@@ -2318,16 +2318,26 @@ API_EXEC_STORE.save_broker(state.BrokerSettings(
     remote_url="http://demo.invalid", account="demo-account", password="demo-password"
 ))
 PENDING_CODE = "demo-manual-order-1"
+SIMULATED_PENDING_CODE = "demo-simulated-order-1"
 archive.write_run(make_payload(
     "20260819-100000",
     stamp="2026-08-19T10:00:00+08:00",
-    instructions=[{
-        "instruction_code": PENDING_CODE,
-        "action": "buy", "market": "SH", "symbol": "510300",
-        "name": "演示宽基甲ETF", "qty": 100, "limit_price": "3.900",
-        "wtbh": None, "理由": "演示", "风险提示": "演示",
-        "状态": "pending", "拦截原因": [],
-    }],
+    instructions=[
+        {
+            "instruction_code": PENDING_CODE,
+            "action": "buy", "market": "SH", "symbol": "510300",
+            "name": "演示宽基甲ETF", "qty": 100, "limit_price": "3.900",
+            "wtbh": None, "理由": "演示", "风险提示": "演示",
+            "状态": "pending", "拦截原因": [],
+        },
+        {
+            "instruction_code": SIMULATED_PENDING_CODE,
+            "action": "buy", "market": "SH", "symbol": "510300",
+            "name": "演示宽基甲ETF", "qty": 100, "limit_price": "3.900",
+            "wtbh": None, "理由": "演示", "风险提示": "演示",
+            "状态": "pending", "拦截原因": [],
+        },
+    ],
 ), root=API_EXEC_ROOT)
 
 
@@ -2370,6 +2380,29 @@ def api_exec_call(method: str, path: str, *, body=None) -> api.Response:
     return api.handle(API_EXEC_APP, api.Request(method, path, {}, body))
 
 
+_pending_before_simulation = api_exec_call("GET", "/api/instructions/pending")
+_pending_simulation_broker = _Broker()
+_pending_simulation = execute(
+    _m0_report(SIMULATED_PENDING_CODE, price="3.900"),
+    Authorization(AuthorizationKind.SIMULATION, "smoke", "api:simulation", NOW),
+    journal=archive.ExecutionJournal(API_EXEC_ROOT),
+    broker=_pending_simulation_broker,
+    now=NOW,
+    policy=POLICY,
+    snapshot=INITIAL_EXPERIMENT,
+)
+_pending_after_simulation = api_exec_call("GET", "/api/instructions/pending")
+check("pending instruction 完成 simulation 后不再返回且 FakeBroker write = 0",
+      SIMULATED_PENDING_CODE in {
+          item["instruction_code"] for item in _pending_before_simulation.payload["data"]
+      }
+      and _pending_simulation.execution_state is ExecutionState.SIMULATED
+      and SIMULATED_PENDING_CODE not in {
+          item["instruction_code"] for item in _pending_after_simulation.payload["data"]
+      }
+      and _pending_simulation_broker.calls == 0)
+
+
 _api_live_lock = runmode.VERIFICATION_LOCK
 runmode.VERIFICATION_LOCK = False  # FakeBroker-only API integration checks
 check("券商配置和会话提供器齐全时,人工执行前置缺项为空",
@@ -2383,8 +2416,8 @@ check("人工接管也走 ValidatedOrder → execution,成功返回委托编号"
 MANUAL_REPLAY = api_exec_call("POST", f"/api/instructions/{PENDING_CODE}/confirm")
 check("同一个 instruction_code 连续 manual confirm 两次,BrokerAdapter write <= 1",
       MANUAL_REPLAY.status == 200 and API_BROKER.orders == 1)
-check("人工执行成功有独立追加留痕,原归档不改写且待处理队列会排除它",
-      len(list(archive.iter_executions(API_EXEC_ROOT))) == 1
+check("人工执行成功在 simulation fact 外独立追加留痕,待处理队列会排除终态",
+      len(list(archive.iter_executions(API_EXEC_ROOT))) == 2
       and api_exec_call("GET", "/api/instructions/pending").payload["data"] == [])
 
 ACTIVITY = api_exec_call("GET", "/api/orders/activity")
@@ -2401,7 +2434,7 @@ check("撤单从接口进入同一 execution 通路并追加留痕",
       CANCELLED.status == 200
       and CANCELLED.payload["data"]["action"] == "cancel"
       and API_BROKER.cancelled == ["demo-order-ref"]
-      and len(list(archive.iter_executions(API_EXEC_ROOT))) == 2)
+      and len(list(archive.iter_executions(API_EXEC_ROOT))) == 3)
 
 
 class _UnknownCancelBroker(_ApiBroker):

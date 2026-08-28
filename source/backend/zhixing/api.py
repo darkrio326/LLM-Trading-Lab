@@ -599,6 +599,7 @@ def get_pending_instructions(app: App, req: Request) -> Response:
             execution.ExecutionState.SUBMITTED_UNKNOWN.value,
             execution.ExecutionState.RECONCILE_REQUIRED.value,
             execution.ExecutionState.REJECTED.value,
+            execution.ExecutionState.SIMULATED.value,
         } or item.get("outcome") in {
             execution.Outcome.SUBMITTED.value,
             execution.Outcome.SUBMITTED_UNKNOWN.value,

@@ -13,7 +13,7 @@
 # "忘了记"在仓库里长得一模一样。
 #
 # 运行:
-#   python -m tests.smoke                       # 自检,475 项
+#   python -m tests.smoke                       # 自检,476 项
 #   python -m zhixing.serve  --archive-root ... # 接口服务(默认只绑 127.0.0.1)
 #   python -m zhixing.daemon --archive-root ... # 轮次驱动(不监听端口)
 #

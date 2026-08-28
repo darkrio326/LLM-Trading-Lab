@@ -127,11 +127,19 @@ class BrokerAdapter(Protocol):
     provider: str
 
     def place_order(self, order: ValidatedOrder) -> str:
-        """Submit one order exactly once and return a broker order reference."""
+        """Perform one broker submission attempt and return a broker order reference.
+
+        The execution coordinator provides instruction_code-level at-most-once invocation and
+        replay safety.
+        """
         ...
 
     def cancel_order(self, wtbh: str) -> None:
-        """Submit one cancellation exactly once."""
+        """Perform one broker cancellation attempt.
+
+        The execution coordinator provides instruction_code-level at-most-once invocation and
+        replay safety.
+        """
         ...
 
 
