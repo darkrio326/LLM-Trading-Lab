@@ -20,8 +20,9 @@
 
 ## 为什么验证锁不读环境变量
 
-三代进入正式运行后仍保留这道源码总闸。正常运行时它为 ``False``;
-需要紧急停止真实委托时改回 ``True`` 并重建镜像。
+LLM-Trading-Lab 的 M0 只授权 simulation baseline，因此源码总闸固定为
+``True``。未来即使完成 broker integration，也必须由 Owner 另行授权后通过
+可审计源码变更解除；当前构建不得触达真实券商写操作。
 
 环境变量会被误配、会被 compose 文件覆盖、会在迁移时丢失。
 写在源码里,改动会进 git diff、会被审、会留在版本历史里。
@@ -43,11 +44,11 @@ logger = logging.getLogger("zhixing.runmode")
 #  验证锁 —— 源码级,运行时不可更改
 # ---------------------------------------------------------------------------
 
-#: 正式运行总闸。False 表示允许执行层触达券商;改回 True 即全局 dry-run。
+#: M0 总闸。True 表示执行层只能形成 durable simulation facts，不能触达券商。
 #:
 #: 这不是无人值守开关。无人值守仍默认关闭,并且只能经带原因的接口开启。
 #: 两道开关分开,才能在保留判断产出的同时立即停止自动发单。
-VERIFICATION_LOCK: Final[bool] = False
+VERIFICATION_LOCK: Final[bool] = True
 
 
 class LiveTradingForbidden(RuntimeError):

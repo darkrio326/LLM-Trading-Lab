@@ -42,7 +42,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Final, Mapping, Protocol, Sequence
 
-from . import SYSTEM_NAME, __version__, archive, context, execution, guards, history, llm, model, prompts
+from . import SYSTEM_NAME, __version__, archive, context, execution, experiment, guards, history, llm, model, prompts
 from . import scheduler, state
 from . import runmode
 from .catalog import Catalog
@@ -210,17 +210,26 @@ def assemble_payload(
         通过 = report is not None and report.ok
         instruction_code = make_instruction_code(strategy_id, object_id, raw.action)
         record = 执行记录.get(instruction_code)
-        状态 = "rejected"
+        状态 = "pending" if 通过 else "rejected"
+        拦截原因 = [] if 通过 else [
+            {"code": f.code, "message": f.message}
+            for f in (report.failures if report else ())
+        ] or [{"code": "NOT_NORMALIZED", "message": "这条指令没有完成 execution integrity 校验。"}]
         wtbh = raw.wtbh
         if record is not None:
-            # 结果不明按“可能已提交”处置,绝不能回到 pending 后再次执行。
-            if record.outcome in {
-                execution.Outcome.SUBMITTED,
-                execution.Outcome.SUBMITTED_UNKNOWN,
+            # 不明或待 reconciliation 都按“可能已提交”封口，不能回到 pending。
+            if record.execution_state in {
+                execution.ExecutionState.SUBMITTED,
+                execution.ExecutionState.SUBMITTED_UNKNOWN,
+                execution.ExecutionState.RECONCILE_REQUIRED,
             }:
                 状态 = "submitted"
-            else:
-                状态 = "pending"
+                拦截原因 = []
+            elif record.execution_state is execution.ExecutionState.REJECTED:
+                状态 = "rejected"
+                拦截原因 = [dict(reason) for reason in record.experiment_policy_reasons] or [{
+                    "code": "EXECUTION_REJECTED", "message": record.message or "执行请求被拒绝。"
+                }]
             wtbh = record.wtbh or wtbh
 
         item: dict[str, Any] = {
@@ -236,10 +245,7 @@ def assemble_payload(
             "风险提示": raw.risk_note,
             "状态": 状态,
             # 契约 1.1:状态 = rejected 时必填,其余状态为 []
-            "拦截原因": [] if 通过 else [
-                {"code": f.code, "message": f.message}
-                for f in (report.failures if report else ())
-            ] or [{"code": "NOT_NORMALIZED", "message": "这条指令没有完成类型规范化。"}],
+            "拦截原因": 拦截原因 if 状态 == "rejected" else [],
         }
         if record is not None:
             item["执行结果"] = execution.record_entry(record)
@@ -259,8 +265,8 @@ def assemble_payload(
 
         "总体判断": _overall(对象判断, 指令, problems),
         "风险控制": {
-            "状态": "本地下单风控已按使用者要求全部拆除",
-            "说明": "交易时段、交易日、标的类型、重复、持仓、资金、整手、价格、涨跌停、金额与偏离均不在本地拦截",
+            "状态": "传统本地交易规则保持拆除；M0 experiment policy 与 execution integrity 已启用",
+            "说明": "不使用 MA/RSI/MACD、趋势、涨跌停预测或自动改价改量；实验资金边界只 PASS/REJECT 原始模型订单",
             "禁止执行条件": list(_forbidden()),
         },
         "交易对象判断": 对象判断,
@@ -317,10 +323,11 @@ def _forbidden() -> tuple[str, ...]:
     而那项校验并不存在。
     """
     条 = [
-        "数量或限价无法转换为券商所需类型时没有可提交参数",
+        "数量或限价无法形成正的有限 broker 参数时拒绝",
+        "实验资金、现金保留、单笔、单标的、回撤、杠杆或卖空边界不通过时原单拒绝",
         "无人值守开关关闭时,自动指令只留痕不提交",
         "SIMULATION 永不触达券商",
-        "写操作绝不自动重试",
+        "instruction_code 已提交、结果不明或需 reconciliation 时绝不自动重试",
     ]
     if not runmode.live_trading_allowed():
         条.insert(0, "验证锁生效期间,一切真实下单一律降级为 dry_run")
@@ -364,6 +371,12 @@ class Runner:
     #: 只有无人值守已开启且不是 SIMULATION 时才会调用。
     broker_provider: Callable[[], execution.BrokerAdapter | None] | None = None
     authorization_kind: execution.AuthorizationKind = execution.AuthorizationKind.UNATTENDED
+    experiment_policy: experiment.ExperimentPolicy = field(
+        default_factory=experiment.ExperimentPolicy
+    )
+    #: M0 默认从通用账户/持仓快照推导实验分配；测试或未来独立实验账本可以
+    #: 显式注入，仍不依赖任何具体券商返回类型。
+    experiment_snapshot: experiment.ExperimentSnapshot | None = None
     #: 时钟。注进来是为了自检能指定"现在是几点几分",不用等。
     clock: Callable[[], datetime] = datetime.now
     system_prompt: str = prompts.SYSTEM_PROMPT
@@ -403,10 +416,10 @@ class Runner:
         logger.info("历史判断:%d/%d 个标的有记录", 有史, len(per_object))
         return 出
 
-    def run_round(self) -> RoundResult:
+    def run_round(self, *, strategy_id: str | None = None) -> RoundResult:
         """跑一轮。**整轮只取一次时间。**"""
         now = self.clock()
-        strategy_id = make_strategy_id(now)
+        strategy_id = strategy_id or make_strategy_id(now)
         catalog = self.store.catalog()
 
         data = self.source.collect(now=now, catalog=catalog)
@@ -473,19 +486,30 @@ class Runner:
             ),
             issued_at=now,
         )
-        broker: execution.BrokerAdapter | None = None
-        should_resolve_broker = (
-            self.authorization_kind is not execution.AuthorizationKind.SIMULATION
-            and runmode.unattended_state().enabled
-            and self.broker_provider is not None
+        metadata_by_code = {
+            report.proposed.instruction_code: execution.ExecutionMetadata(
+                strategy_id=strategy_id,
+                object_id=object_id,
+                model=self.target.name,
+                llm_provider=self.target.provider,
+                confidence=judgments[object_id].置信度,
+            )
+            for object_id, report in reports.items()
+        }
+        policy_snapshot = self.experiment_snapshot or experiment.snapshot_from_validation_context(
+            data.account,
+            data.objects,
+            config=self.experiment_policy.config,
         )
-        if should_resolve_broker:
-            try:
-                broker = self.broker_provider()
-            except Exception as exc:  # noqa: BLE001 - broker=None 会形成可见执行记录
-                logger.error("取得券商适配器失败,异常类型=%s", exc.__class__.__name__)
         batch = execution.submit_reports(
-            list(reports.values()), auth, broker=broker, now=now
+            list(reports.values()),
+            auth,
+            journal=archive.ExecutionJournal(self.archive_root),
+            broker_provider=self.broker_provider,
+            now=now,
+            policy=self.experiment_policy,
+            snapshot=policy_snapshot,
+            metadata_by_code=metadata_by_code,
         )
 
         payload = assemble_payload(
@@ -624,11 +648,17 @@ class Runner:
 
     def tick(self) -> RoundResult | None:
         """到点就跑一轮,没到点返回 ``None``。驱动循环调这个。"""
+        execution.reconcile_incomplete(
+            archive.ExecutionJournal(self.archive_root), now=self.clock()
+        )
         slot = self.due()
         if slot is None:
             return None
         logger.info("%s 到点,开跑", slot.label)
-        return self.run_round()
+        # 自动轮次的 identity 锚定计划 slot，而不是进程重启后的墙上时钟。
+        # broker side effect 后、round archive 前崩溃时，重启仍生成相同
+        # instruction_code，durable execution journal 才能阻止重复提交。
+        return self.run_round(strategy_id=make_strategy_id(slot.fire_at))
 
 
 __all__ = [

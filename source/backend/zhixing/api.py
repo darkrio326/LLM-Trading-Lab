@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import SYSTEM_NAME, __version__, archive, catalog as catalog_mod
-from . import execution, guards, runmode, scheduler, state
+from . import execution, experiment, guards, runmode, scheduler, state
 from . import captcha, model
 
 logger = logging.getLogger("zhixing.api")
@@ -126,6 +126,14 @@ class App:
     actor: str = "web"
     #: 人工确认、撤单与委托查询用的券商适配器。None 表示当前没有会话来源。
     broker_provider: Callable[[], Any] | None = None
+    experiment_policy: experiment.ExperimentPolicy = field(
+        default_factory=experiment.ExperimentPolicy
+    )
+    #: 可选的独立实验分配快照来源。M0 默认从非机密账户摘要构造；不依赖
+    #: Eastmoney 或任何其他具体券商类型。
+    experiment_snapshot_provider: Callable[
+        [guards.GuardReport], experiment.ExperimentSnapshot
+    ] | None = None
     #: 这一份数据是从哪儿来的,原样进 ``/api/status`` 的「数据源」。
     #:
     #: **默认值是"还没有",不是某种来源。** 这里原先写死着一句
@@ -580,10 +588,19 @@ def get_pending_instructions(app: App, req: Request) -> Response:
 
     只看三代自己的归档:二代的指令仍由二代负责,两代执行记录不混用。
     """
+    execution.reconcile_incomplete(
+        archive.ExecutionJournal(app.archive_root), now=app.now()
+    )
     completed = {
         str(item.get("instruction_code") or "")
         for item in archive.iter_executions(app.archive_root)
-        if item.get("outcome") in {
+        if item.get("execution_state") in {
+            execution.ExecutionState.SUBMITTED.value,
+            execution.ExecutionState.SUBMITTED_UNKNOWN.value,
+            execution.ExecutionState.RECONCILE_REQUIRED.value,
+            execution.ExecutionState.REJECTED.value,
+            execution.ExecutionState.SIMULATED.value,
+        } or item.get("outcome") in {
             execution.Outcome.SUBMITTED.value,
             execution.Outcome.SUBMITTED_UNKNOWN.value,
         }
@@ -608,6 +625,9 @@ def live_order_blockers(app: App) -> tuple[str, ...]:
     """人工执行通路当前缺什么。空元组表示可以尝试连接券商。"""
     缺: list[str] = []
 
+    if not runmode.live_trading_allowed():
+        缺.append("M0 验证锁生效：当前构建不授权真实 BrokerAdapter 写操作")
+
     try:
         settings = app.store.broker()
     except state.StateError as exc:
@@ -621,16 +641,50 @@ def live_order_blockers(app: App) -> tuple[str, ...]:
     return tuple(缺)
 
 
-def confirm_instruction(app: App, req: Request, code: str) -> Response:
-    """人工接管一条归档中的 pending 指令。仍走唯一 ValidatedOrder 通路。"""
-    try:
-        runmode.assert_live_trading_allowed(what="人工接管下单")
-    except runmode.LiveTradingForbidden:
-        return fail(
-            403, "DRY_RUN_LOCKED", "三代当前为只读验证模式,不执行任何真实下单"
-        )
+def _experiment_snapshot(
+    app: App, report: guards.GuardReport
+) -> experiment.ExperimentSnapshot:
+    if app.experiment_snapshot_provider is not None:
+        return app.experiment_snapshot_provider(report)
+    return experiment.snapshot_from_account_summary(
+        app.store.account(), config=app.experiment_policy.config
+    )
 
+
+def _execution_response(record: execution.ExecutionRecord) -> Response:
+    entry = execution.record_entry(record)
+    if record.execution_state in {
+        execution.ExecutionState.SUBMITTED_UNKNOWN,
+        execution.ExecutionState.RECONCILE_REQUIRED,
+    }:
+        return Response(202, {"ok": True, "data": entry})
+    if record.execution_state is execution.ExecutionState.SUBMITTED:
+        return ok(entry)
+    if record.execution_state is execution.ExecutionState.SIMULATED:
+        return fail(403, "DRY_RUN_LOCKED", record.message or "当前构建不授权真实下单")
+    if record.execution_state is execution.ExecutionState.NOT_AUTHORIZED:
+        return fail(409, "NOT_AUTHORIZED", record.message or "当前授权不允许执行")
+    if (
+        record.execution_state is execution.ExecutionState.REJECTED
+        and record.experiment_policy_result == experiment.PolicyResult.REJECT.value
+    ):
+        problems = tuple(
+            (str(reason.get("code") or "POLICY_REJECTED"), str(reason.get("message") or ""))
+            for reason in record.experiment_policy_reasons
+        )
+        return fail(
+            422,
+            "EXPERIMENT_POLICY_REJECTED",
+            _joined(problems) or "实验资金政策拒绝了原始模型订单",
+            problems=problems,
+        )
+    return fail(503, "BROKER_UNAVAILABLE", record.message or "BrokerAdapter 请求没有完成")
+
+
+def confirm_instruction(app: App, req: Request, code: str) -> Response:
+    """人工接管一条 pending 指令，和 unattended 共用同一 execution coordinator。"""
     item: Mapping[str, Any] | None = None
+    parent: Mapping[str, Any] | None = None
     for payload in _all_runs(app, system_name=SYSTEM_NAME):
         for candidate in payload.get("待执行指令") or ():
             if (
@@ -639,6 +693,7 @@ def confirm_instruction(app: App, req: Request, code: str) -> Response:
                 and candidate.get("状态") == "pending"
             ):
                 item = candidate
+                parent = payload
                 break
         if item is not None:
             break
@@ -661,27 +716,43 @@ def confirm_instruction(app: App, req: Request, code: str) -> Response:
         ),
         guards.ValidationContext(account=None, objects={}, now=now),
     )
+    object_id = f"{str(item.get('market') or '')}_{str(item.get('symbol') or '')}".strip("_")
+    confidence: float | None = None
+    if parent is not None:
+        for judgment in parent.get("交易对象判断") or ():
+            if isinstance(judgment, Mapping) and str(judgment.get("object_id") or "") == object_id:
+                raw_confidence = judgment.get("置信度")
+                if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
+                    confidence = float(raw_confidence)
+                break
+    metadata = execution.ExecutionMetadata(
+        strategy_id=str((parent or {}).get("strategy_id") or ""),
+        object_id=object_id,
+        model=str((parent or {}).get("model") or ""),
+        llm_provider=str((parent or {}).get("llm_provider") or ""),
+        confidence=confidence,
+    )
+    record = execution.execute(
+        report,
+        execution.Authorization(
+            kind=execution.AuthorizationKind.MANUAL,
+            actor=app.actor,
+            source=f"api:confirm:{code}",
+            issued_at=now,
+        ),
+        journal=archive.ExecutionJournal(app.archive_root),
+        broker_provider=app.broker_provider,
+        now=now,
+        policy=app.experiment_policy,
+        snapshot=_experiment_snapshot(app, report),
+        metadata=metadata,
+    )
     if not report.ok or report.order is None:
         problems = tuple((p.code, p.message) for p in report.failures)
         return fail(
             400, "INVALID_INSTRUCTION", _joined(problems), problems=problems
         )
-
-    broker = _resolve_broker(app)
-    auth = execution.Authorization(
-        kind=execution.AuthorizationKind.MANUAL,
-        actor=app.actor,
-        source=f"api:confirm:{code}",
-        issued_at=now,
-    )
-    record = execution.submit(report.order, auth, broker=broker, now=now)
-    entry = execution.record_entry(record)
-    archive.write_execution(entry, root=app.archive_root)
-    if record.outcome is execution.Outcome.SUBMITTED_UNKNOWN:
-        return Response(202, {"ok": True, "data": entry})
-    if record.outcome is execution.Outcome.SUBMITTED:
-        return ok(entry)
-    return fail(503, "BROKER_UNAVAILABLE", record.message or "委托没有发出")
+    return _execution_response(record)
 
 
 def _resolve_broker(app: App) -> Any:
@@ -753,7 +824,7 @@ def cancel_order(app: App, req: Request, wtbh: str) -> Response:
     now = app.now()
     report = guards.validate(
         guards.ProposedOrder(
-            instruction_code=f"cancel-{wtbh}-{now:%Y%m%d%H%M%S}",
+            instruction_code=f"cancel-{wtbh}",
             action="cancel",
             market="",
             symbol="",
@@ -766,24 +837,22 @@ def cancel_order(app: App, req: Request, wtbh: str) -> Response:
     )
     if not report.ok or report.order is None:
         return fail(400, "INVALID_CANCEL", "撤单指令无法完成类型规范化")
-    record = execution.submit(
-        report.order,
+    record = execution.execute(
+        report,
         execution.Authorization(
             kind=execution.AuthorizationKind.MANUAL,
             actor=app.actor,
             source="api:cancel",
             issued_at=now,
         ),
-        broker=_resolve_broker(app),
+        journal=archive.ExecutionJournal(app.archive_root),
+        broker_provider=app.broker_provider,
         now=now,
+        policy=app.experiment_policy,
+        snapshot=_experiment_snapshot(app, report),
+        metadata=execution.ExecutionMetadata(object_id=f"broker-order:{wtbh}"),
     )
-    entry = execution.record_entry(record)
-    archive.write_execution(entry, root=app.archive_root)
-    if record.outcome is execution.Outcome.SUBMITTED_UNKNOWN:
-        return Response(202, {"ok": True, "data": entry})
-    if record.outcome is execution.Outcome.SUBMITTED:
-        return ok(entry)
-    return fail(503, "BROKER_UNAVAILABLE", record.message or "撤单请求没有发出")
+    return _execution_response(record)
 
 
 # ---------------------------------------------------------------------------

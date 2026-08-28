@@ -38,13 +38,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Mapping
+
+import fcntl
 
 logger = logging.getLogger("zhixing.archive")
 
@@ -81,6 +86,162 @@ SUMMARY_COUNTS = {
 
 class ArchiveError(RuntimeError):
     """归档写入被拒。全部拒写路径都用它,调用方不需要分辨子类。"""
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory entry after an atomic rename."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _mkdirs_durable(path: Path) -> None:
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for created in reversed(missing):
+        _fsync_directory(created)
+        _fsync_directory(created.parent)
+
+
+def _write_json_durable(target: Path, payload: Mapping[str, Any]) -> None:
+    """Write one immutable JSON fact and fsync both file and parent directory."""
+    _mkdirs_durable(target.parent)
+    tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False).encode("utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+        _fsync_directory(target.parent)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+class ExecutionJournalTransaction:
+    """One instruction-scoped transaction held under an inter-process file lock."""
+
+    def __init__(self, directory: Path, instruction_code: str) -> None:
+        self.directory = directory
+        self.instruction_code = instruction_code
+
+    def events(self) -> tuple[dict[str, Any], ...]:
+        out: list[dict[str, Any]] = []
+        for path in sorted(self.directory.glob("[0-9][0-9][0-9][0-9][0-9][0-9]-*.json")):
+            event = read_path(path)
+            if str(event.get("instruction_code") or "") != self.instruction_code:
+                raise ArchiveError(
+                    f"execution journal identity mismatch:{path.name}"
+                )
+            out.append(event)
+        return tuple(out)
+
+    def latest(self) -> dict[str, Any] | None:
+        events = self.events()
+        return events[-1] if events else None
+
+    def append(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Append a complete immutable state fact.  Existing facts are never rewritten."""
+        instruction_code = str(payload.get("instruction_code") or "").strip()
+        state = str(payload.get("execution_state") or "").strip()
+        event_at = str(payload.get("event_at") or "").strip()
+        problems: list[str] = []
+        if instruction_code != self.instruction_code:
+            problems.append("`instruction_code` 与 journal transaction 不一致")
+        if not state or not re.fullmatch(r"[A-Z][A-Z0-9_]*", state):
+            problems.append("`execution_state` 缺失或格式不合法")
+        try:
+            datetime.fromisoformat(event_at)
+        except ValueError:
+            problems.append("`event_at` 不是合法 ISO 时间")
+        problems.extend(
+            f"机密不得入档 —— {finding}" for finding in scan_for_secrets(payload)
+        )
+        if problems:
+            raise ArchiveError(
+                "execution journal event 被拒,共 %d 条:\n  - %s"
+                % (len(problems), "\n  - ".join(problems))
+            )
+
+        sequence = len(self.events()) + 1
+        event_id = uuid.uuid4().hex
+        stored = {
+            **dict(payload),
+            "record_id": event_id,
+            "event_id": event_id,
+            "sequence": sequence,
+        }
+        target = self.directory / f"{sequence:06d}-{state.lower()}-{event_id}.json"
+        if target.exists():
+            raise ArchiveError(f"execution journal event 已存在:{target.name}")
+        _write_json_durable(target, stored)
+        return stored
+
+
+class ExecutionJournal:
+    """Append-only durable execution facts keyed by ``instruction_code``.
+
+    Random event ids identify facts only.  Replay decisions always use the exact instruction code
+    and the latest durable state while holding the instruction-scoped lock.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+
+    @staticmethod
+    def _key(instruction_code: str) -> str:
+        code = str(instruction_code or "").strip()
+        if not code:
+            raise ArchiveError("execution journal 要求非空 instruction_code")
+        return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    def _directory(self, instruction_code: str) -> Path:
+        return self.root / "_execution" / "journal" / self._key(instruction_code)
+
+    @contextmanager
+    def transaction(self, instruction_code: str) -> Iterator[ExecutionJournalTransaction]:
+        directory = self._directory(instruction_code)
+        _mkdirs_durable(directory)
+        lock_path = directory / ".lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+b", closefd=True) as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield ExecutionJournalTransaction(directory, instruction_code)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def latest(self, instruction_code: str) -> dict[str, Any] | None:
+        with self.transaction(instruction_code) as tx:
+            return tx.latest()
+
+    def iter_events(self) -> Iterator[dict[str, Any]]:
+        base = self.root / "_execution" / "journal"
+        if not base.exists():
+            return
+        events: list[dict[str, Any]] = []
+        for path in base.glob("*/[0-9][0-9][0-9][0-9][0-9][0-9]-*.json"):
+            events.append(read_path(path))
+        events.sort(
+            key=lambda event: (
+                str(event.get("event_at") or ""),
+                str(event.get("instruction_code") or ""),
+                int(event.get("sequence") or 0),
+            )
+        )
+        yield from events
 
 
 # ---------------------------------------------------------------------------
@@ -264,13 +425,7 @@ def write_run(payload: Mapping[str, Any], *, root: Path) -> Path:
             "归档只追加——要更正请补一轮新的,不要改旧的。"
         )
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False),
-        encoding="utf-8",
-    )
-    os.replace(tmp, target)
+    _write_json_durable(target, payload)
 
     logger.info("归档落盘 %s(%d 条判断 / %d 条指令)",
                 target.name,
@@ -304,27 +459,49 @@ def write_execution(payload: Mapping[str, Any], *, root: Path) -> Path:
     target = Path(root) / "_execution" / month / f"{record_id}.json"
     if target.exists():
         raise ArchiveError(f"执行留痕已存在,不覆盖:{record_id}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False),
-        encoding="utf-8",
-    )
-    os.replace(tmp, target)
+    _write_json_durable(target, payload)
     logger.info("执行留痕落盘 %s", target.name)
     return target
 
 
 def iter_executions(root: Path) -> Iterator[dict[str, Any]]:
-    """按时间正序读取独立执行事件;坏文件跳过并记日志。"""
+    """Read the latest durable fact per instruction, plus legacy one-record events."""
     base = Path(root) / "_execution"
     if not base.exists():
         return
+    latest: dict[str, dict[str, Any]] = {}
+    journal = ExecutionJournal(root)
+    try:
+        for event in journal.iter_events():
+            code = str(event.get("instruction_code") or "")
+            if code:
+                latest[code] = event
+    except ArchiveError as exc:
+        logger.error("execution journal 读不出来:%s", exc)
+        raise
+
+    legacy: list[dict[str, Any]] = []
     for path in sorted(base.glob("*/*.json")):
         try:
-            yield read_path(path)
+            legacy.append(read_path(path))
         except ArchiveError as exc:
             logger.error("跳过读不出来的执行留痕 %s:%s", path.name, exc)
+    combined = legacy + list(latest.values())
+    combined.sort(
+        key=lambda event: str(
+            event.get("completed_at")
+            or event.get("attempted_at")
+            or event.get("event_at")
+            or event.get("created_at")
+            or ""
+        )
+    )
+    yield from combined
+
+
+def iter_execution_events(root: Path) -> Iterator[dict[str, Any]]:
+    """Read every append-only state transition for audit/reconstruction."""
+    yield from ExecutionJournal(root).iter_events()
 
 
 # ---------------------------------------------------------------------------

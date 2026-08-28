@@ -8,12 +8,17 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 
-from zhixing import catalog, context, guards, history, llm, model, prompts, runmode, runner
+from zhixing import archive, catalog, context, experiment, guards, history, llm, model, prompts, runmode, runner
 from zhixing.broker import BrokerError
-from zhixing.execution import Authorization, AuthorizationKind, Outcome, submit, submit_reports
+from zhixing.execution import (
+    Authorization, AuthorizationKind, ExecutionState, Outcome, execute,
+    reconcile_incomplete, submit, submit_reports,
+)
 
 PASS, FAIL = "  [OK]", "  [!!]"
 results: list[bool] = []
@@ -79,7 +84,7 @@ except RuntimeError as exc:
     check(f"手工伪造被拒:{str(exc)[:28]}...", True)
 
 
-print("\n=== 保证二:风控全拆,只保留类型规范化 ===")
+print("\n=== 保证二:传统风控保持拆除,execution integrity 参数必须完整 ===")
 
 bad_qty = guards.validate(
     guards.ProposedOrder("a1", "buy", "SH", "510300", "演示标的一",
@@ -112,12 +117,21 @@ removed_cases = (
                                     qty=5000, limit_price="3.900")),
     ("超大金额", guards.ProposedOrder("r3", "buy", "SH", "510300", "演示标的一",
                                     qty=200000, limit_price="39.00")),
-    ("负数量与负价格", guards.ProposedOrder("r4", "buy", "SH", "510300", "演示标的一",
-                                          qty=-100, limit_price="-3.90")),
 )
 for label, proposed in removed_cases:
     report = guards.validate(proposed, CTX)
     check(f"已拆风控不再拦:{label}", report.ok and not report.failures)
+
+negative_qty = guards.validate(
+    guards.ProposedOrder("r4q", "buy", "SH", "510300", "演示标的一",
+                         qty=0, limit_price="3.90"), CTX)
+negative_price = guards.validate(
+    guards.ProposedOrder("r4p", "sell", "SH", "510300", "演示标的一",
+                         qty=100, limit_price=0), CTX)
+check("qty <= 0 属于 execution integrity,明确拒绝",
+      [f.code for f in negative_qty.failures] == ["QTY_NOT_POSITIVE"])
+check("BUY/SELL limit_price <= 0 属于 execution integrity,明确拒绝",
+      [f.code for f in negative_price.failures] == ["PRICE_NOT_POSITIVE"])
 
 after_hours = guards.validate(
     guards.ProposedOrder("r5", "buy", "SH", "510300", "演示标的一",
@@ -133,7 +147,7 @@ check("交易时段与交易日检查已拆除", after_hours.ok and weekend.ok)
 
 good = guards.validate(
     guards.ProposedOrder("c1", "buy", "SH", "510300", "演示标的一",
-                         qty=1000, limit_price="3.900"),
+                         qty=100, limit_price="3.900"),
     CTX,
 )
 check("规范化仍产出唯一 ValidatedOrder 通路", good.ok and good.order is not None)
@@ -141,11 +155,13 @@ check("规范化仍产出唯一 ValidatedOrder 通路", good.ok and good.order i
 
 print("\n=== 保证三:执行授权、模拟隔离和结果不明 ===")
 
-check("源码验证锁已解除", runmode.VERIFICATION_LOCK is False)
-check("live_trading_allowed() 为 True", runmode.live_trading_allowed() is True)
+check("M0 源码验证锁固定生效", runmode.VERIFICATION_LOCK is True)
+check("M0 不授权 live trading", runmode.live_trading_allowed() is False)
 
 
 class _Broker:
+    provider = "fake"
+
     def __init__(self, *, unknown: bool = False) -> None:
         self.calls = 0
         self.unknown = unknown
@@ -180,19 +196,316 @@ check("开关关闭时 UNATTENDED 被拒且券商零调用",
       closed.outcome is Outcome.REJECTED and closed_broker.calls == 0)
 
 runmode.set_unattended(True, changed_by="smoke-test", reason="自检:执行链")
-missing_broker = submit(good.order, auth, broker=None, now=NOW)
-check("券商未配置走 broker=None 留痕,不抛异常",
-      missing_broker.outcome is Outcome.FAILED and "券商适配器" in missing_broker.message)
+_original_lock = runmode.VERIFICATION_LOCK
+runmode.VERIFICATION_LOCK = False
+try:
+    missing_broker = submit(good.order, auth, broker=None, now=NOW)
+    check("没有 durable journal 时执行层拒绝 broker write,不抛异常",
+          missing_broker.outcome is Outcome.FAILED and "journal" in missing_broker.message)
 
-unknown_broker = _Broker(unknown=True)
-unknown = submit(good.order, auth, broker=unknown_broker, now=NOW)
-check("submitted_unknown 不被吞成普通失败",
-      unknown.outcome is Outcome.SUBMITTED_UNKNOWN
-      and unknown.submitted_unknown and unknown_broker.calls == 1)
+    _unknown_root = Path(tempfile.mkdtemp(prefix="zhixing-unknown-journal-"))
+    unknown_broker = _Broker(unknown=True)
+    unknown = submit(
+        good.order, auth, journal=archive.ExecutionJournal(_unknown_root),
+        broker=unknown_broker, now=NOW)
+    check("submitted_unknown 不被吞成普通失败",
+          unknown.outcome is Outcome.SUBMITTED_UNKNOWN
+          and unknown.submitted_unknown and unknown_broker.calls == 1)
 
-batch = submit_reports([good, bad_both], auth, broker=None, now=NOW)
-check("批量执行同时保留可执行记录与类型转换失败",
-      len(batch.records) == 1 and len(batch.blocked) == 1)
+    batch = submit_reports([good, bad_both], auth, broker=None, now=NOW)
+    check("批量执行保留全部 proposed facts 与类型转换失败",
+          len(batch.records) == 2 and len(batch.blocked) == 1)
+finally:
+    runmode.VERIFICATION_LOCK = _original_lock
+
+
+print("\n=== M0:实验资金政策、durable journal 与 replay safety ===")
+
+POLICY = experiment.ExperimentPolicy()
+INITIAL_EXPERIMENT = experiment.ExperimentSnapshot.initial(POLICY.config)
+MANUAL_AUTH = Authorization(
+    kind=AuthorizationKind.MANUAL, actor="smoke", source="m0:manual", issued_at=NOW,
+)
+
+
+def _m0_report(code: str, *, action="buy", qty=100, price="4.20", wtbh=None):
+    return guards.validate(
+        guards.ProposedOrder(
+            code, action, "SH", "510300", "FakeBroker 测试标的",
+            qty=qty, limit_price=price, wtbh=wtbh,
+        ),
+        CTX,
+    )
+
+
+def _reason_codes(record) -> set[str]:
+    return {str(reason.get("code")) for reason in record.experiment_policy_reasons}
+
+
+_m0_lock = runmode.VERIFICATION_LOCK
+runmode.VERIFICATION_LOCK = False  # only FakeBroker calls inside this guarded test block
+try:
+    _legal_root = Path(tempfile.mkdtemp(prefix="zhixing-m0-legal-"))
+    _legal_broker = _Broker()
+    _legal = execute(
+        _m0_report("m0-legal"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_legal_root), broker=_legal_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("合法 420 CNY 原单穿过通用 FakeBrokerAdapter",
+          _legal.execution_state is ExecutionState.SUBMITTED and _legal_broker.calls == 1)
+    _legal_again = execute(
+        _m0_report("m0-legal"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_legal_root), broker=_legal_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("同一 manual instruction 连续执行两次,FakeBroker write <= 1",
+          _legal_again.execution_state is ExecutionState.SUBMITTED and _legal_broker.calls == 1)
+
+    _events = list(archive.iter_execution_events(_legal_root))
+    check("Broker write 前已有 durable PREPARED/AUTHORIZED/EXECUTING facts",
+          [event["execution_state"] for event in _events]
+          == ["PREPARED", "AUTHORIZED", "EXECUTING", "SUBMITTED"])
+    _final_fact = list(archive.iter_executions(_legal_root))[0]
+    _fact_fields = {
+        "strategy_id", "instruction_code", "object_id", "action", "proposed_qty",
+        "proposed_limit_price", "proposed_notional", "model", "llm_provider",
+        "confidence", "experiment_policy_result", "experiment_policy_reasons",
+        "authorization_kind", "execution_state", "broker_provider", "broker_receipt",
+        "created_at", "attempted_at", "completed_at",
+    }
+    check("durable experiment fact 含 M0 要求的关联字段且 broker identity 非机密",
+          _fact_fields <= set(_final_fact) and _final_fact["broker_provider"] == "fake")
+
+    _single_broker = _Broker()
+    _single = execute(
+        _m0_report("m0-single", qty=200, price="4.00"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-single-"))),
+        broker=_single_broker, now=NOW, policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("单笔金额 > 600 CNY 原单 REJECT,不自动缩量",
+          _single.execution_state is ExecutionState.REJECTED
+          and "MAX_SINGLE_ORDER_EXCEEDED" in _reason_codes(_single)
+          and _single.proposed_qty == 200 and _single_broker.calls == 0)
+
+    _budget_snapshot = experiment.ExperimentSnapshot(
+        net_equity_cny=Decimal("1000"), available_cash_cny=Decimal("500"),
+        deployed_capital_cny=Decimal("500"),
+        symbol_exposure_cny={"159999": Decimal("500")},
+        symbol_position_qty={"159999": 100},
+    )
+    _budget_broker = _Broker()
+    _budget = execute(
+        _m0_report("m0-budget"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-budget-"))),
+        broker=_budget_broker, now=NOW, policy=POLICY, snapshot=_budget_snapshot,
+    )
+    check("总实验资金边界超限 REJECT 且 BrokerAdapter 零调用",
+          "EXPERIMENT_BUDGET_EXCEEDED" in _reason_codes(_budget)
+          and "MIN_CASH_RESERVE_BREACHED" in _reason_codes(_budget)
+          and _budget_broker.calls == 0)
+
+    _symbol_snapshot = experiment.ExperimentSnapshot(
+        net_equity_cny=Decimal("1000"), available_cash_cny=Decimal("700"),
+        deployed_capital_cny=Decimal("300"),
+        symbol_exposure_cny={"510300": Decimal("300")},
+        symbol_position_qty={"510300": 70},
+    )
+    _symbol_broker = _Broker()
+    _symbol = execute(
+        _m0_report("m0-symbol"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-symbol-"))),
+        broker=_symbol_broker, now=NOW, policy=POLICY, snapshot=_symbol_snapshot,
+    )
+    check("单一标的拟敞口 > 600 CNY REJECT",
+          "MAX_SINGLE_SYMBOL_EXPOSURE_EXCEEDED" in _reason_codes(_symbol)
+          and _symbol_broker.calls == 0)
+
+    _drawdown = experiment.ExperimentSnapshot(
+        net_equity_cny=Decimal("750"), available_cash_cny=Decimal("330"),
+        deployed_capital_cny=Decimal("420"),
+        symbol_exposure_cny={"510300": Decimal("420")},
+        symbol_position_qty={"510300": 100},
+    )
+    _draw_buy_broker = _Broker()
+    _draw_buy = execute(
+        _m0_report("m0-draw-buy"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-draw-buy-"))),
+        broker=_draw_buy_broker, now=NOW, policy=POLICY, snapshot=_drawdown,
+    )
+    check("实验净值 <= 750 时新的 BUY REJECT",
+          "EXPERIMENT_DRAWDOWN_BUY_LOCK" in _reason_codes(_draw_buy)
+          and _draw_buy_broker.calls == 0)
+
+    _draw_sell_broker = _Broker()
+    _draw_sell = execute(
+        _m0_report("m0-draw-sell", action="sell"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-draw-sell-"))),
+        broker=_draw_sell_broker, now=NOW, policy=POLICY, snapshot=_drawdown,
+    )
+    check("实验净值 <= 750 时 SELL 仍 PASS 并可经 FakeBroker 退出风险",
+          _draw_sell.execution_state is ExecutionState.SUBMITTED
+          and _draw_sell_broker.calls == 1)
+
+    _short_broker = _Broker()
+    _short_snapshot = experiment.ExperimentSnapshot(
+        net_equity_cny=Decimal("750"), available_cash_cny=Decimal("540"),
+        deployed_capital_cny=Decimal("210"),
+        symbol_exposure_cny={"510300": Decimal("210")},
+        symbol_position_qty={"510300": 50},
+    )
+    _short = execute(
+        _m0_report("m0-short", action="sell"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-short-"))),
+        broker=_short_broker, now=NOW, policy=POLICY, snapshot=_short_snapshot,
+    )
+    check("SELL 超过实验持仓时按禁止 short selling REJECT",
+          "SHORT_SELLING_FORBIDDEN" in _reason_codes(_short)
+          and _short_broker.calls == 0)
+
+    _cancel_broker = _Broker()
+    _cancel = execute(
+        _m0_report("m0-cancel", action="cancel", wtbh="fake-order-ref"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-cancel-"))),
+        broker=_cancel_broker, now=NOW, policy=POLICY, snapshot=_drawdown,
+    )
+    check("净值触发 BUY lock 后 CANCEL 仍 PASS",
+          _cancel.execution_state is ExecutionState.SUBMITTED
+          and _cancel_broker.calls == 1)
+
+    _reject_broker = _Broker()
+    _reject = execute(
+        _m0_report("m0-reject-zero", qty=1000, price="4.20"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-reject-"))),
+        broker=_reject_broker, now=NOW, policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("policy reject 时 FakeBrokerAdapter write 严格为零",
+          _reject.execution_state is ExecutionState.REJECTED and _reject_broker.calls == 0)
+
+    _simulation_root = Path(tempfile.mkdtemp(prefix="zhixing-m0-sim-"))
+    _simulation_broker = _Broker()
+    _simulation = execute(
+        _m0_report("m0-simulation"),
+        Authorization(AuthorizationKind.SIMULATION, "smoke", "m0:simulation", NOW),
+        journal=archive.ExecutionJournal(_simulation_root),
+        broker=_simulation_broker, now=NOW, policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("SIMULATION 即使测试块临时解锁也保持 BrokerAdapter write = 0",
+          _simulation.execution_state is ExecutionState.SIMULATED
+          and _simulation_broker.calls == 0)
+    _simulation_live_replay = execute(
+        _m0_report("m0-simulation"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_simulation_root),
+        broker=_simulation_broker, now=NOW, policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("历史 SIMULATED instruction 在未来 live unlock 后仍是终态且 BrokerAdapter write = 0",
+          _simulation_live_replay.execution_state is ExecutionState.SIMULATED
+          and _simulation_broker.calls == 0)
+
+    runmode.set_unattended(True, changed_by="smoke", reason="M0 duplicate unattended")
+    _auto_root = Path(tempfile.mkdtemp(prefix="zhixing-m0-auto-"))
+    _auto_broker = _Broker()
+    _auto_auth = Authorization(
+        AuthorizationKind.UNATTENDED, "scheduler", "m0:unattended", NOW)
+    _auto_first = execute(
+        _m0_report("m0-auto-duplicate"), _auto_auth,
+        journal=archive.ExecutionJournal(_auto_root), broker=_auto_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    _auto_second = execute(
+        _m0_report("m0-auto-duplicate"), _auto_auth,
+        journal=archive.ExecutionJournal(_auto_root), broker=_auto_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("同一 unattended instruction replay,FakeBroker write <= 1",
+          _auto_first.execution_state is ExecutionState.SUBMITTED
+          and _auto_second.execution_state is ExecutionState.SUBMITTED
+          and _auto_broker.calls == 1)
+
+    _unknown_root = Path(tempfile.mkdtemp(prefix="zhixing-m0-unknown-replay-"))
+    _unknown_broker = _Broker(unknown=True)
+    _unknown_first = execute(
+        _m0_report("m0-unknown-replay"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_unknown_root), broker=_unknown_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    _unknown_second = execute(
+        _m0_report("m0-unknown-replay"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_unknown_root), broker=_unknown_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("SUBMITTED_UNKNOWN 永不 replay",
+          _unknown_first.execution_state is ExecutionState.SUBMITTED_UNKNOWN
+          and _unknown_second.execution_state is ExecutionState.SUBMITTED_UNKNOWN
+          and _unknown_broker.calls == 1)
+
+    class _EmptyReceiptBroker(_Broker):
+        def place_order(self, order):
+            self.calls += 1
+            return ""
+
+    _empty_root = Path(tempfile.mkdtemp(prefix="zhixing-m0-empty-receipt-"))
+    _empty_broker = _EmptyReceiptBroker()
+    _empty_first = execute(
+        _m0_report("m0-empty-receipt"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_empty_root), broker=_empty_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    _empty_second = execute(
+        _m0_report("m0-empty-receipt"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_empty_root), broker=_empty_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("BrokerAdapter write 后缺少 order reference 进入 SUBMITTED_UNKNOWN 且不 replay",
+          _empty_first.execution_state is ExecutionState.SUBMITTED_UNKNOWN
+          and _empty_second.execution_state is ExecutionState.SUBMITTED_UNKNOWN
+          and _empty_broker.calls == 1)
+
+    class _CrashBroker(_Broker):
+        def place_order(self, order):
+            self.calls += 1
+            raise SystemExit("模拟 broker side effect 后进程崩溃")
+
+    _crash_root = Path(tempfile.mkdtemp(prefix="zhixing-m0-reconcile-"))
+    _crash_broker = _CrashBroker()
+    try:
+        execute(
+            _m0_report("m0-reconcile"), MANUAL_AUTH,
+            journal=archive.ExecutionJournal(_crash_root), broker=_crash_broker, now=NOW,
+            policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+        )
+    except SystemExit:
+        pass
+    _recovery_records = reconcile_incomplete(
+        archive.ExecutionJournal(_crash_root), now=NOW
+    )
+    _retry_broker = _Broker()
+    _recovered = execute(
+        _m0_report("m0-reconcile"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_crash_root), broker=_retry_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    _replayed = execute(
+        _m0_report("m0-reconcile"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_crash_root), broker=_retry_broker, now=NOW,
+        policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("恢复发现 EXECUTING 时进入 RECONCILE_REQUIRED 且永不 replay",
+          _crash_broker.calls == 1 and _retry_broker.calls == 0
+          and len(_recovery_records) == 1
+          and _recovered.execution_state is ExecutionState.RECONCILE_REQUIRED
+          and _replayed.execution_state is ExecutionState.RECONCILE_REQUIRED)
+
+    check("核心 execution safety 证明只使用 FakeBroker,不依赖 EastmoneyBroker",
+          all(b.provider == "fake" for b in (
+              _legal_broker, _single_broker, _budget_broker, _draw_buy_broker,
+              _draw_sell_broker, _symbol_broker, _short_broker, _cancel_broker,
+              _reject_broker, _simulation_broker, _auto_broker,
+              _unknown_broker, _empty_broker, _crash_broker, _retry_broker,
+          )))
+finally:
+    runmode.VERIFICATION_LOCK = _m0_lock
+    runmode.set_unattended(False, changed_by="smoke", reason="M0 safety block cleanup")
 
 
 print("\n=== 保证四:标的属性只有一个来源(清单),不写死在代码里 ===")
@@ -932,12 +1245,12 @@ check("没配账号时的空值不算机密(否则「还没配」和「明文泄
       archive.scan_for_secrets({"账户标识": ""}) == ()
       and archive.scan_for_secrets({"账户标识": None}) == ())
 
-# -- 正式运行总闸 ---------------------------------------------------------
+# -- M0 simulation 总闸 ---------------------------------------------------
 
 CONFIRM = call("POST", "/api/instructions/i-001/confirm")
-check("状态接口明确显示总闸已经进入 live,不是只改了源码不让界面知道",
-      STATUS["运行模式"] == "live" and STATUS["验证锁"] is False)
-check("总闸解除后人工接口会继续查指令,不会再恒返回 DRY_RUN_LOCKED",
+check("状态接口明确显示 M0 为 dry_run 且验证锁生效",
+      STATUS["运行模式"] == "dry_run" and STATUS["验证锁"] is True)
+check("M0 人工接口仍先解析 exact instruction,不存在就是 NOT_FOUND",
       CONFIRM.status == 404 and CONFIRM.payload["error"]["code"] == "NOT_FOUND")
 check("待接管指令为空是常态,返回空数组不是报错",
       call("GET", "/api/instructions/pending").payload["data"] == [])
@@ -1328,8 +1641,8 @@ class _RoundSource:
             objects={
                 "510300": guards.ObjectSnapshot(
                     symbol="510300", last_price=Decimal("3.912"),
-                    prev_close=Decimal("3.900"), available_qty=2000,
-                    holding_qty=2000, is_etf=True),
+                    prev_close=Decimal("3.900"), available_qty=0,
+                    holding_qty=0, is_etf=True),
                 "159999": guards.ObjectSnapshot(
                     symbol="159999", last_price=Decimal("1.234"),
                     prev_close=Decimal("1.230"), is_etf=True),
@@ -1369,7 +1682,7 @@ class _ScriptedCaller:
             "object_id": "SH_510300", "操作": "buy",
             "理由": ["演示理由"], "风险": ["演示风险"], "置信度": 0.7,
             "改判条件": "跌破演示均线就改判",
-            "指令": {"action": "buy", "qty": 1000, "limit_price": "3.912",
+            "指令": {"action": "buy", "qty": 100, "limit_price": "3.912",
                      "理由": "演示", "风险提示": "演示"},
         }, ensure_ascii=False)), object_id=object_id)
 
@@ -1511,6 +1824,8 @@ ONE_STORE.save_catalog([
 
 # 券商不可用是已知缺项:执行结果如实为 failed,但模型轮次本身仍算成功。
 runmode.set_unattended(True, changed_by="smoke", reason="自检:券商为空")
+_runner_live_lock = runmode.VERIFICATION_LOCK
+runmode.VERIFICATION_LOCK = False  # FakeBroker-only integration checks
 NONE_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-none-broker-archive-"))
 NONE_RESULT = runner.Runner(
     store=ONE_STORE,
@@ -1552,6 +1867,48 @@ check("结果不明按可能已提交处置,不留在 pending 造成下一次重
       UNKNOWN_INSTR["状态"] == "submitted" and UNKNOWN_BROKER.calls == 1)
 check("结果不明的底层浏览器异常原文不会进归档",
       "模拟浏览器异常" not in json.dumps(UNKNOWN_INSTR, ensure_ascii=False))
+
+# broker 已接受并写完 SUBMITTED journal，但 round archive 随后崩溃；用同一
+# slot-stable strategy_id 恢复时不得再调用 BrokerAdapter。
+CRASH_ROUND_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-round-crash-archive-"))
+CRASH_ROUND_BROKER = _Broker()
+CRASH_ROUND_RUNNER = runner.Runner(
+    store=ONE_STORE,
+    archive_root=CRASH_ROUND_ROOT,
+    caller=_ScriptedCaller(),
+    target=OPENAI,
+    source=_OneSource(),
+    broker_provider=lambda: CRASH_ROUND_BROKER,
+    clock=lambda: datetime(2026, 8, 17, 10, 25, 0),
+)
+CRASH_SLOT_STRATEGY_ID = runner.make_strategy_id(datetime(2026, 8, 17, 10, 25, 0))
+_real_write_run = archive.write_run
+_crash_after_broker = {"once": True}
+
+
+def _crash_before_round_archive(payload, *, root):
+    if _crash_after_broker["once"]:
+        _crash_after_broker["once"] = False
+        raise OSError("模拟 broker success 后、round archive 前 crash")
+    return _real_write_run(payload, root=root)
+
+
+archive.write_run = _crash_before_round_archive
+try:
+    CRASH_ROUND_RUNNER.run_round(strategy_id=CRASH_SLOT_STRATEGY_ID)
+except OSError:
+    pass
+finally:
+    archive.write_run = _real_write_run
+CRASH_ROUND_RECOVERED = CRASH_ROUND_RUNNER.run_round(
+    strategy_id=CRASH_SLOT_STRATEGY_ID
+)
+check("broker success 后、round archive 前 crash,恢复不重新提交",
+      CRASH_ROUND_BROKER.calls == 1
+      and CRASH_ROUND_RECOVERED.path is not None
+      and CRASH_ROUND_RECOVERED.path.exists())
+
+runmode.VERIFICATION_LOCK = _runner_live_lock
 runmode.set_unattended(False, changed_by="smoke", reason="自检结束,恢复默认关闭")
 
 # 排期:跑过的那一轮不会再跑
@@ -1565,7 +1922,7 @@ check("非交易日不跑",
 
 shutil.rmtree(RUN_ROOT, ignore_errors=True)
 shutil.rmtree(RUN_STATE, ignore_errors=True)
-for _path in (SIM_ROOT, ONE_STATE, NONE_ROOT, UNKNOWN_ROOT):
+for _path in (SIM_ROOT, ONE_STATE, NONE_ROOT, UNKNOWN_ROOT, CRASH_ROUND_ROOT):
     shutil.rmtree(_path, ignore_errors=True)
 
 
@@ -1936,7 +2293,8 @@ _CONF_STORE = state.Store(Path(tempfile.mkdtemp(prefix="zhixing-conf-")))
 _CONF_APP = api.App(store=_CONF_STORE, archive_root=API_ARCHIVE)
 _BLOCKERS = api.live_order_blockers(_CONF_APP)
 check("人工接管缺项一次报全:配置与会话提供器各自可见",
-      len(_BLOCKERS) == 2
+      len(_BLOCKERS) == 3
+      and any("M0 验证锁" in x for x in _BLOCKERS)
       and any("券商未配置齐全" in x for x in _BLOCKERS)
       and any("会话提供器" in x for x in _BLOCKERS))
 check("已拆除的日历与旧复核风控不会偷偷留在人工通路",
@@ -1947,7 +2305,7 @@ check("**「券商适配器尚未实现」这句话不许再出现**"
 
 _CONF_RESP = api.confirm_instruction(
     _CONF_APP, api.Request(method="POST", path="/x", query={}, body=None), "C1")
-check("验证锁解除后人工接管会继续查归档,不存在就是正常 NOT_FOUND",
+check("M0 验证锁不掩盖 exact instruction 查找,不存在就是正常 NOT_FOUND",
       _CONF_RESP.status == 404
       and _CONF_RESP.payload["error"]["code"] == "NOT_FOUND")
 
@@ -1960,20 +2318,32 @@ API_EXEC_STORE.save_broker(state.BrokerSettings(
     remote_url="http://demo.invalid", account="demo-account", password="demo-password"
 ))
 PENDING_CODE = "demo-manual-order-1"
+SIMULATED_PENDING_CODE = "demo-simulated-order-1"
 archive.write_run(make_payload(
     "20260819-100000",
     stamp="2026-08-19T10:00:00+08:00",
-    instructions=[{
-        "instruction_code": PENDING_CODE,
-        "action": "buy", "market": "SH", "symbol": "510300",
-        "name": "演示宽基甲ETF", "qty": 100, "limit_price": "3.900",
-        "wtbh": None, "理由": "演示", "风险提示": "演示",
-        "状态": "pending", "拦截原因": [],
-    }],
+    instructions=[
+        {
+            "instruction_code": PENDING_CODE,
+            "action": "buy", "market": "SH", "symbol": "510300",
+            "name": "演示宽基甲ETF", "qty": 100, "limit_price": "3.900",
+            "wtbh": None, "理由": "演示", "风险提示": "演示",
+            "状态": "pending", "拦截原因": [],
+        },
+        {
+            "instruction_code": SIMULATED_PENDING_CODE,
+            "action": "buy", "market": "SH", "symbol": "510300",
+            "name": "演示宽基甲ETF", "qty": 100, "limit_price": "3.900",
+            "wtbh": None, "理由": "演示", "风险提示": "演示",
+            "状态": "pending", "拦截原因": [],
+        },
+    ],
 ), root=API_EXEC_ROOT)
 
 
 class _ApiBroker:
+    provider = "fake"
+
     def __init__(self) -> None:
         self.orders = 0
         self.cancelled: list[str] = []
@@ -2010,6 +2380,31 @@ def api_exec_call(method: str, path: str, *, body=None) -> api.Response:
     return api.handle(API_EXEC_APP, api.Request(method, path, {}, body))
 
 
+_pending_before_simulation = api_exec_call("GET", "/api/instructions/pending")
+_pending_simulation_broker = _Broker()
+_pending_simulation = execute(
+    _m0_report(SIMULATED_PENDING_CODE, price="3.900"),
+    Authorization(AuthorizationKind.SIMULATION, "smoke", "api:simulation", NOW),
+    journal=archive.ExecutionJournal(API_EXEC_ROOT),
+    broker=_pending_simulation_broker,
+    now=NOW,
+    policy=POLICY,
+    snapshot=INITIAL_EXPERIMENT,
+)
+_pending_after_simulation = api_exec_call("GET", "/api/instructions/pending")
+check("pending instruction 完成 simulation 后不再返回且 FakeBroker write = 0",
+      SIMULATED_PENDING_CODE in {
+          item["instruction_code"] for item in _pending_before_simulation.payload["data"]
+      }
+      and _pending_simulation.execution_state is ExecutionState.SIMULATED
+      and SIMULATED_PENDING_CODE not in {
+          item["instruction_code"] for item in _pending_after_simulation.payload["data"]
+      }
+      and _pending_simulation_broker.calls == 0)
+
+
+_api_live_lock = runmode.VERIFICATION_LOCK
+runmode.VERIFICATION_LOCK = False  # FakeBroker-only API integration checks
 check("券商配置和会话提供器齐全时,人工执行前置缺项为空",
       api.live_order_blockers(API_EXEC_APP) == ())
 MANUAL_SENT = api_exec_call("POST", f"/api/instructions/{PENDING_CODE}/confirm")
@@ -2018,8 +2413,11 @@ check("人工接管也走 ValidatedOrder → execution,成功返回委托编号"
       and MANUAL_SENT.payload["data"]["outcome"] == "submitted"
       and MANUAL_SENT.payload["data"]["wtbh"] == "demo-order-ref"
       and API_BROKER.orders == 1)
-check("人工执行成功有独立追加留痕,原归档不改写且待处理队列会排除它",
-      len(list(archive.iter_executions(API_EXEC_ROOT))) == 1
+MANUAL_REPLAY = api_exec_call("POST", f"/api/instructions/{PENDING_CODE}/confirm")
+check("同一个 instruction_code 连续 manual confirm 两次,BrokerAdapter write <= 1",
+      MANUAL_REPLAY.status == 200 and API_BROKER.orders == 1)
+check("人工执行成功在 simulation fact 外独立追加留痕,待处理队列会排除终态",
+      len(list(archive.iter_executions(API_EXEC_ROOT))) == 2
       and api_exec_call("GET", "/api/instructions/pending").payload["data"] == [])
 
 ACTIVITY = api_exec_call("GET", "/api/orders/activity")
@@ -2036,7 +2434,7 @@ check("撤单从接口进入同一 execution 通路并追加留痕",
       CANCELLED.status == 200
       and CANCELLED.payload["data"]["action"] == "cancel"
       and API_BROKER.cancelled == ["demo-order-ref"]
-      and len(list(archive.iter_executions(API_EXEC_ROOT))) == 2)
+      and len(list(archive.iter_executions(API_EXEC_ROOT))) == 3)
 
 
 class _UnknownCancelBroker(_ApiBroker):
@@ -2055,6 +2453,8 @@ check("结果不明的底层异常原文不会进响应或独立执行归档",
       and "模拟内部路径细节" not in json.dumps(
           list(archive.iter_executions(API_EXEC_ROOT)), ensure_ascii=False
       ))
+
+runmode.VERIFICATION_LOCK = _api_live_lock
 
 shutil.rmtree(API_EXEC_ROOT, ignore_errors=True)
 shutil.rmtree(API_EXEC_STATE, ignore_errors=True)

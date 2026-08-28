@@ -1,4 +1,6 @@
-# 知行 Zhixing
+# LLM-Trading-Lab（知行 Zhixing 独立实验 fork）
+
+本仓库 fork 自 [`mivus1128/zhixing`](https://github.com/mivus1128/zhixing)，用于复刻并验证其 LLM-driven trading 方法。当前 M0 只建立 **SAFE FOR SIMULATION** 的执行安全基线：源码 verification lock 保持生效，不授权配置真实券商账号、真实下单、unattended live trading 或 live deployment。实验边界与归因见 [docs/EXPERIMENT.md](docs/EXPERIMENT.md)。
 
 知行是第三代自托管交易研究与自动化工作台。项目包含 Python 后端、React 前端、独立浏览器容器和 Docker Compose 部署配置。
 
@@ -50,7 +52,7 @@ ssh -L 18765:127.0.0.1:18765 user@server
 1. 在“交易对象”页添加需要研究或运行的标的；公开版不会预置个人清单。
 2. 模型服务的接口地址、协议、模型名称和 Key。
 3. 验证码服务的识别方式、接口地址、模型和 Key；需要时可增加备用识别服务。
-4. 券商连接；Docker 部署的浏览器远端填写 `http://browser:4444/wd/hub`，账号和交易密码在这里录入。
+4. upstream 券商连接入口仍保留；**LLM-Trading-Lab M0 不得在这里录入真实账号或交易密码**。
 5. 调度时点与运行模式。
 
 这些值保存在 Docker 的私有 `runtime` 卷中，不写入源码目录，也不通过 `.env` 提交。重新构建镜像不会自动删除它们。

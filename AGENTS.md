@@ -15,9 +15,15 @@
 
 ## 核心行为边界
 
-券商登录、验证码识别、交易执行、策略生成和自动轮次属于核心行为。除非项目所有者明确要求，不得修改、删除、重命名、重构或改变这些流程的既有语义，也不得加入额外确认步骤或默认禁用现有能力。
+本仓库是独立实验项目 **LLM-Trading-Lab**，fork 自 `mivus1128/zhixing`；保留 upstream attribution，但后续治理、实验结论和发布身份均属于本仓库。
 
-部署、文档、前端和不改变核心行为的数据展示改动可以正常进行。对边界有疑问时，先向项目所有者确认。
+- `execution.BrokerAdapter` 是唯一通用券商写边界。核心 execution、policy、journal、idempotency 与 replay safety 必须保持 broker-agnostic；不得把 Eastmoney 页面、URL、Selenium 细节或字段写进通用层。Eastmoney 只是 upstream 当前 adapter，不是固定券商。
+- 券商登录、验证码识别、交易执行、策略生成和自动轮次属于核心行为。修改这些语义必须有 Owner 对 exact scope 的明确授权。
+- 未经 Owner 单独明确授权，不得接入或操作真实券商账户，不得执行真实 BUY/SELL/CANCEL，不得开启 unattended live trading，也不得解除源码 verification lock。
+- 未经 Owner 明确授权，不得修改 prompt、指标、行情语义、六轮调度、LLM 决策格式、模型 qty/limit_price 权限或历史判断等 strategy semantics。
+- 不得把新券商预先猜进 contract。后续 broker integration 必须单独设计、评审和授权；不要大规模重命名 `zhixing` Python package。
+
+部署、文档、前端和不改变上述核心语义的数据展示改动可以正常进行。对边界有疑问时，先向项目所有者确认。
 
 ## 验证
 
