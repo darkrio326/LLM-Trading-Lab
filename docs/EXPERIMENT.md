@@ -72,7 +72,7 @@ journal 位于既有 `archive/_execution/journal/` 边界内。每次状态迁�
 
 恢复规则：
 
-- `SUBMITTED`、`SUBMITTED_UNKNOWN`、`REJECTED`、`RECONCILE_REQUIRED` 不自动 replay；
+- `SUBMITTED`、`SUBMITTED_UNKNOWN`、`REJECTED`、`SIMULATED`、`RECONCILE_REQUIRED` 都是 `instruction_code` 的 replay-blocking terminal state，不自动 replay；历史 simulation instruction 即使未来解除 live lock，也不能被 promote 为真钱订单；
 - 恢复时看见 `EXECUTING`，说明 broker 可能已收到请求但本地没有明确 receipt，必须追加 `RECONCILE_REQUIRED`，禁止自动重试；
 - broker success 后、round archive 前崩溃时，自动轮次用 slot-stable `strategy_id` 重建相同 `instruction_code`，journal 会阻止再次提交；
 - SIMULATION 和源码 M0 verification lock 永远不调用 BrokerAdapter 写操作；

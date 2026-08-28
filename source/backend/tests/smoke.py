@@ -382,15 +382,24 @@ try:
     check("policy reject 时 FakeBrokerAdapter write 严格为零",
           _reject.execution_state is ExecutionState.REJECTED and _reject_broker.calls == 0)
 
+    _simulation_root = Path(tempfile.mkdtemp(prefix="zhixing-m0-sim-"))
     _simulation_broker = _Broker()
     _simulation = execute(
         _m0_report("m0-simulation"),
         Authorization(AuthorizationKind.SIMULATION, "smoke", "m0:simulation", NOW),
-        journal=archive.ExecutionJournal(Path(tempfile.mkdtemp(prefix="zhixing-m0-sim-"))),
+        journal=archive.ExecutionJournal(_simulation_root),
         broker=_simulation_broker, now=NOW, policy=POLICY, snapshot=INITIAL_EXPERIMENT,
     )
     check("SIMULATION 即使测试块临时解锁也保持 BrokerAdapter write = 0",
           _simulation.execution_state is ExecutionState.SIMULATED
+          and _simulation_broker.calls == 0)
+    _simulation_live_replay = execute(
+        _m0_report("m0-simulation"), MANUAL_AUTH,
+        journal=archive.ExecutionJournal(_simulation_root),
+        broker=_simulation_broker, now=NOW, policy=POLICY, snapshot=INITIAL_EXPERIMENT,
+    )
+    check("历史 SIMULATED instruction 在未来 live unlock 后仍是终态且 BrokerAdapter write = 0",
+          _simulation_live_replay.execution_state is ExecutionState.SIMULATED
           and _simulation_broker.calls == 0)
 
     runmode.set_unattended(True, changed_by="smoke", reason="M0 duplicate unattended")

@@ -73,6 +73,7 @@ REPLAY_BLOCKING_STATES = frozenset({
     ExecutionState.SUBMITTED,
     ExecutionState.SUBMITTED_UNKNOWN,
     ExecutionState.REJECTED,
+    ExecutionState.SIMULATED,
     ExecutionState.RECONCILE_REQUIRED,
 })
 
