@@ -62,7 +62,7 @@ from pathlib import Path
 from typing import Any
 
 from . import SYSTEM_NAME, __version__
-from . import collect, execution, llm, runner, runmode, scheduler, simulation, state, tradingdays
+from . import activation, collect, execution, llm, runner, runmode, scheduler, simulation, state, tradingdays
 
 logger = logging.getLogger("zhixing.daemon")
 
@@ -81,7 +81,12 @@ COMPLAIN_EVERY = 1800.0
 # ---------------------------------------------------------------------------
 
 
-def preflight(store: state.Store, *, now: datetime | None = None) -> tuple[str, ...]:
+def preflight(
+    store: state.Store,
+    *,
+    now: datetime | None = None,
+    archive_root: Path | None = None,
+) -> tuple[str, ...]:
     """跑一轮之前必须具备的东西。返回缺了什么,**空元组表示可以跑**。
 
     **一次报全部**,和 ``guards.validate`` / ``BrokerSettings.missing``
@@ -119,6 +124,13 @@ def preflight(store: state.Store, *, now: datetime | None = None) -> tuple[str, 
     if not catalog.tradable:
         缺.append("标的清单里一个可交易标的都没有(交易对象页)")
 
+    if archive_root is not None:
+        缺.extend(activation.runtime_problems(
+            store,
+            activation.experiment_ledger(archive_root),
+            now=现在,
+        ))
+
     # 券商没配**不拦**这一轮:没有账户照样能出判断,只是出不了指令
     # (``collect`` 会把它记成 ACCOUNT_UNAVAILABLE 进归档)。判断本身是
     # 这个系统的主要产出,不该被"还没填账号"卡住。
@@ -140,7 +152,7 @@ def build_runner(
     重装的代价是几个 dataclass,一天六次,不值一提。
     """
     settings = store.model()
-    ledger = simulation.ExperimentLedger(archive_root)
+    ledger = activation.experiment_ledger(archive_root)
     return runner.Runner(
         store=store,
         archive_root=archive_root,
@@ -203,7 +215,7 @@ class Daemon:
             return None
 
         try:
-            缺 = preflight(self.store)
+            缺 = preflight(self.store, archive_root=self.archive_root)
         except state.StateError as exc:
             self._complain(f"配置读不出来:{exc}")
             return None

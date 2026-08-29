@@ -23,13 +23,20 @@ case "$MODE" in
       compose up -d --build
     fi
     ;;
+  experiment)
+    if docker compose up --help 2>/dev/null | grep -q -- '--wait'; then
+      compose --profile experiment up -d --build --wait --wait-timeout 240
+    else
+      compose --profile experiment up -d --build
+    fi
+    ;;
   *)
-    echo "用法: bash scripts/start.sh [full|web]" >&2
+    echo "用法: bash scripts/start.sh [full|web|experiment]" >&2
     exit 2
     ;;
 esac
 
-compose --profile collector ps
+compose --profile collector --profile experiment ps
 echo
 echo "知行已启动。默认地址: http://127.0.0.1:18765"
 echo "如果修改了 .env 中的主机或端口，请使用修改后的地址。"

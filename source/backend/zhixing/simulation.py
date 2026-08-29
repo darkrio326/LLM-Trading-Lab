@@ -321,9 +321,11 @@ def _empty_state(
     benchmark: SimulationBenchmarkConfig,
     *,
     started_at: datetime | None,
+    experiment_id: str = EXPERIMENT_ID,
 ) -> dict[str, Any]:
     cash = _money(initial_cash)
     return {
+        "experiment_id": experiment_id,
         "initial_cash": _text(cash),
         "cash": _text(cash),
         "positions": {},
@@ -338,6 +340,8 @@ def _empty_state(
         "current_drawdown_pct": "0",
         "max_drawdown_pct": "0",
         "started_at": started_at.isoformat() if started_at else None,
+        "experiment_metadata": None,
+        "model_regime": None,
         "last_mark_at": None,
         "benchmark": {
             "cash_nav": _text(cash),
@@ -479,7 +483,7 @@ class _LedgerTransaction:
         missing = sorted(_REQUIRED_EVENT_FIELDS - set(payload))
         if missing:
             problems.append("缺少字段:" + ",".join(missing))
-        if str(payload.get("experiment_id") or "") != EXPERIMENT_ID:
+        if str(payload.get("experiment_id") or "") != self.ledger.experiment_id:
             problems.append("experiment_id 不匹配")
         code = str(payload.get("instruction_code") or "").strip()
         if not code:
@@ -516,10 +520,15 @@ class ExperimentLedger:
     initial_cash: Decimal = Decimal("1000")
     fee_model: SimulationFeeModel = field(default_factory=SimulationFeeModel)
     benchmark: SimulationBenchmarkConfig = field(default_factory=SimulationBenchmarkConfig)
+    require_explicit_start: bool = False
+    experiment_id: str = EXPERIMENT_ID
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
         self.initial_cash = _money(self.initial_cash)
+        self.experiment_id = self.experiment_id.strip()
+        if not self.experiment_id:
+            raise ExperimentLedgerError("experiment_id 不能为空")
 
     @property
     def directory(self) -> Path:
@@ -539,7 +548,7 @@ class ExperimentLedger:
                 raise ExperimentLedgerError(
                     f"experiment ledger sequence 不连续:{path.name} expected={expected}"
                 )
-            if str(event.get("experiment_id") or "") != EXPERIMENT_ID:
+            if str(event.get("experiment_id") or "") != self.experiment_id:
                 raise ExperimentLedgerError(f"experiment ledger identity mismatch:{path.name}")
             events.append(event)
         return events
@@ -548,7 +557,10 @@ class ExperimentLedger:
         self, events: Sequence[Mapping[str, Any]]
     ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
         if not events:
-            return _empty_state(self.initial_cash, self.benchmark, started_at=None), {}
+            return _empty_state(
+                self.initial_cash, self.benchmark, started_at=None,
+                experiment_id=self.experiment_id,
+            ), {}
         latest = events[-1]
         state = latest.get("account_state")
         orders = latest.get("orders_state")
@@ -578,11 +590,25 @@ class ExperimentLedger:
     def initialize(self, *, at: datetime) -> dict[str, Any]:
         with self._transaction() as tx:
             if tx.events:
+                if self.require_explicit_start and not isinstance(
+                    tx.state.get("experiment_metadata"), Mapping
+                ):
+                    raise ExperimentLedgerError(
+                        "M2 runtime 缺少 EXPERIMENT_STARTED fact，禁止自动初始化"
+                    )
                 return copy.deepcopy(tx.state)
-            state = _empty_state(self.initial_cash, self.benchmark, started_at=at)
+            if self.require_explicit_start:
+                raise ExperimentLedgerError(
+                    "M2 runtime 尚未形成 EXPERIMENT_STARTED fact，禁止自动初始化"
+                )
+            state = _empty_state(
+                self.initial_cash, self.benchmark, started_at=at,
+                experiment_id=self.experiment_id,
+            )
             event = _event(
                 event_type="INITIALIZED", strategy_id="experiment",
-                instruction_code=INITIAL_INSTRUCTION_CODE, object_id="", action="initialize",
+                instruction_code=f"experiment:{self.experiment_id}:initialize",
+                object_id="", action="initialize",
                 qty=0, model_limit_price=None, execution_price=None,
                 order_state="INITIALIZED", fill_qty=0, fee=Decimal("0"),
                 cash_delta=Decimal("0"), position_delta=0,
@@ -597,6 +623,113 @@ class ExperimentLedger:
             )
             tx.append(event)
             return copy.deepcopy(state)
+
+    def activate(self, *, at: datetime, metadata: Mapping[str, Any]) -> dict[str, Any]:
+        """Append the one explicit M2 start fact, or return the existing identical start.
+
+        Activation is deliberately separate from ``initialize``.  A daemon round must never turn
+        an unconfigured runtime into a started experiment merely because a schedule slot arrived.
+        """
+        normalized = copy.deepcopy(dict(metadata))
+        if str(normalized.get("experiment_id") or "") != self.experiment_id:
+            raise ExperimentLedgerError("experiment metadata identity mismatch")
+        if archive.scan_for_secrets(normalized):
+            raise ExperimentLedgerError("experiment metadata 含疑似机密，禁止启动")
+
+        with self._transaction() as tx:
+            existing = tx.state.get("experiment_metadata")
+            if tx.events:
+                if isinstance(existing, Mapping) and dict(existing) == normalized:
+                    return copy.deepcopy(tx.state)
+                raise ExperimentLedgerError(
+                    "existing experiment facts 与本次 activation metadata 不一致"
+                )
+
+            state = _empty_state(
+                self.initial_cash, self.benchmark, started_at=at,
+                experiment_id=self.experiment_id,
+            )
+            state["experiment_metadata"] = normalized
+            state["model_regime"] = copy.deepcopy(normalized.get("model"))
+            event = _event(
+                event_type="EXPERIMENT_STARTED", strategy_id="experiment",
+                instruction_code=f"experiment:{self.experiment_id}:start",
+                object_id="", action="start",
+                qty=0, model_limit_price=None, execution_price=None,
+                order_state="EXPERIMENT_STARTED", fill_qty=0, fee=Decimal("0"),
+                cash_delta=Decimal("0"), position_delta=0,
+                realized_delta=Decimal("0"), resulting_position=None,
+                at=at, state=state, orders={}, extra={
+                    "experiment_metadata": normalized,
+                },
+            )
+            tx.append(event)
+            return copy.deepcopy(state)
+
+    def record_model_regime_change(
+        self,
+        *,
+        at: datetime,
+        from_model: Mapping[str, Any],
+        to_model: Mapping[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Append an authorized model-regime fact without resetting account state.
+
+        This method does not choose or configure a model.  It only provides the durable fact
+        boundary for a future Owner-authorized change; automatic fallback is intentionally absent.
+        """
+        old = copy.deepcopy(dict(from_model))
+        new = copy.deepcopy(dict(to_model))
+        why = reason.strip()
+        if not why:
+            raise ExperimentLedgerError("model regime change 必须记录 reason")
+        if archive.scan_for_secrets({"from": old, "to": new, "reason": why}):
+            raise ExperimentLedgerError("model regime change fact 含疑似机密")
+
+        material = json.dumps(
+            {"at": at.isoformat(), "from": old, "to": new},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        instruction_code = "experiment:model-regime:" + hashlib.sha256(
+            material.encode("utf-8")
+        ).hexdigest()
+        with self._transaction() as tx:
+            metadata = tx.state.get("experiment_metadata")
+            if not isinstance(metadata, Mapping):
+                raise ExperimentLedgerError("实验尚未开始，不能记录 model regime change")
+            current = tx.state.get("model_regime")
+            if isinstance(current, Mapping) and dict(current) == new:
+                return copy.deepcopy(tx.state)
+            if not isinstance(current, Mapping) or dict(current) != old:
+                raise ExperimentLedgerError("from model 与当前 model regime 不一致")
+
+            state = copy.deepcopy(tx.state)
+            state["model_regime"] = new
+            nav = _money(state.get("nav"))
+            tx.append(_event(
+                event_type="MODEL_REGIME_CHANGED", strategy_id="experiment",
+                instruction_code=instruction_code, object_id="", action="model_change",
+                qty=0, model_limit_price=None, execution_price=None,
+                order_state="MODEL_REGIME_CHANGED", fill_qty=0, fee=Decimal("0"),
+                cash_delta=Decimal("0"), position_delta=0,
+                realized_delta=Decimal("0"), resulting_position=None,
+                at=at, state=state, orders=tx.orders, extra={
+                    "from_model": old,
+                    "to_model": new,
+                    "reason": why,
+                    "nav_at_switch": _text(nav),
+                },
+            ))
+            return copy.deepcopy(state)
+
+    def activation_metadata(self) -> dict[str, Any] | None:
+        state, _ = self._read()
+        metadata = state.get("experiment_metadata")
+        return copy.deepcopy(dict(metadata)) if isinstance(metadata, Mapping) else None
+
+    def is_started(self) -> bool:
+        return self.activation_metadata() is not None
 
     def iter_events(self) -> Iterator[dict[str, Any]]:
         if not self.directory.exists():
@@ -626,7 +759,16 @@ class ExperimentLedger:
             if order.get("state") == SyntheticOrderState.OPEN.value
         ]
         return {
-            "experiment_id": EXPERIMENT_ID,
+            "experiment_id": self.experiment_id,
+            "activation_state": (
+                "EXPERIMENT_STARTED"
+                if isinstance(state.get("experiment_metadata"), Mapping)
+                else "LEGACY_INITIALIZED"
+                if state.get("started_at")
+                else "NOT_STARTED"
+            ),
+            "experiment_metadata": copy.deepcopy(state.get("experiment_metadata")),
+            "current_model_regime": copy.deepcopy(state.get("model_regime")),
             "initial_cash": _text(state.get("initial_cash")),
             "current_cash": _text(state.get("cash")),
             "available_cash": _text(available),
@@ -766,7 +908,7 @@ def _event(
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
-        "experiment_id": EXPERIMENT_ID,
+        "experiment_id": str(state.get("experiment_id") or EXPERIMENT_ID),
         "event_type": event_type,
         "strategy_id": strategy_id,
         "instruction_code": instruction_code,

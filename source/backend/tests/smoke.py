@@ -930,6 +930,260 @@ check("M1 未修改 prompt / indicators / six-round scheduler baseline",
       ))
 
 
+print("\n=== M2:Experiment #1 显式 activation 与 runtime hard gates ===")
+
+from zoneinfo import ZoneInfo as _M2ZoneInfo
+
+from zhixing import activation as m2_activation
+from zhixing import api as m2_api
+from zhixing import collect as m2_collect
+from zhixing import daemon as m2_daemon
+from zhixing import state as m2_state
+
+M2_NOW = datetime(2026, 8, 17, 8, 30, tzinfo=_M2ZoneInfo("Asia/Shanghai"))
+M2_RUNTIME = Path(tempfile.mkdtemp(prefix="zhixing-m2-runtime-"))
+M2_ARCHIVE = Path(tempfile.mkdtemp(prefix="zhixing-m2-archive-"))
+M2_STORE = m2_state.Store(M2_RUNTIME)
+M2_CHANGED = m2_activation.prepare_runtime(M2_STORE)
+M2_LEDGER = m2_activation.experiment_ledger(M2_ARCHIVE)
+M2_INITIAL = M2_LEDGER.summary()
+
+check("M2 private runtime seed 固定 exact three-ETF universe / T+1 / lot 100",
+      M2_CHANGED == ("catalog", "schedule")
+      and [obj.object_id for obj in M2_STORE.catalog().objects]
+      == ["SH_510300", "SZ_159915", "SH_512880"]
+      and all(
+          obj.asset_type == "ETF"
+          and obj.lot_size == 100
+          and obj.turnover_mode == catalog.TURNOVER_T1
+          and obj.is_tradable
+          for obj in M2_STORE.catalog().objects
+      ))
+check("M2 schedule 固定六个 Asia/Shanghai slot，首个未来 slot 不补跑 10:00",
+      M2_STORE.schedule().as_text() == m2_activation.SCHEDULE_TEXT
+      and m2_activation.first_future_slot(
+          datetime(2026, 8, 17, 10, 5, tzinfo=_M2ZoneInfo("Asia/Shanghai"))
+      )["planned"].startswith("2026-08-17T11:15:00"))
+check("未启动的 strict ExperimentLedger 只读投影为 1000 / empty，不自动写 fact",
+      M2_INITIAL["activation_state"] == "NOT_STARTED"
+      and M2_INITIAL["current_cash"] == "1000.00"
+      and M2_INITIAL["nav"] == "1000.00"
+      and M2_INITIAL["positions"] == []
+      and list(M2_LEDGER.iter_events()) == []
+      and _raises(paper.ExperimentLedgerError,
+                  lambda: M2_LEDGER.initialize(at=M2_NOW)))
+
+M2_LEGACY_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m2-legacy-ledger-"))
+M2_LEGACY_LEDGER = paper.ExperimentLedger(M2_LEGACY_ROOT)
+M2_LEGACY_LEDGER.initialize(at=NOW)
+M2_LEGACY_PATH = next(M2_LEGACY_LEDGER.directory.glob("*.json"))
+M2_LEGACY_EVENT = json.loads(M2_LEGACY_PATH.read_text(encoding="utf-8"))
+M2_LEGACY_EVENT["account_state"].pop("experiment_id", None)
+M2_LEGACY_PATH.write_text(
+    json.dumps(M2_LEGACY_EVENT, ensure_ascii=False), encoding="utf-8"
+)
+M2_LEGACY_RESTART = paper.ExperimentLedger(M2_LEGACY_ROOT)
+_m1_refs(
+    paper.PaperExecutionEngine(M2_LEGACY_RESTART),
+    strategy="m1-upgrade-compat", price="4.00",
+)
+check("M1 frozen identity 与旧 serialized state 升级后仍可重建并继续 append",
+      M2_LEGACY_RESTART.summary()["experiment_id"]
+      == "isolated-cny-1000-v1"
+      and all(
+          event["experiment_id"] == "isolated-cny-1000-v1"
+          for event in M2_LEGACY_RESTART.iter_events()
+      ))
+
+M2_INITIAL_API = m2_api.handle(
+    m2_api.App(
+        store=M2_STORE, archive_root=M2_ARCHIVE,
+        broker_provider=None, experiment_ledger=M2_LEDGER,
+    ),
+    m2_api.Request("GET", "/api/experiment"),
+)
+check("启动前 GET /api/experiment 正常且 API broker_provider=None",
+      M2_INITIAL_API.status == 200
+      and M2_INITIAL_API.payload["data"]["activation_state"] == "NOT_STARTED"
+      and M2_INITIAL_API.payload["data"]["current_cash"] == "1000.00")
+
+try:
+    m2_activation.activate(
+        store=M2_STORE, ledger=M2_LEDGER, now=M2_NOW,
+        storage_kind=m2_activation.STORAGE_KIND_DOCKER_VOLUME,
+    )
+    M2_MISSING_MODEL_CODE = ""
+except m2_activation.ActivationError as exc:
+    M2_MISSING_MODEL_CODE = exc.code
+check("真实 endpoint/name/key 缺失时保持 READY_BUT_MODEL_UNCONFIGURED 且无 start fact",
+      M2_MISSING_MODEL_CODE == "READY_BUT_MODEL_UNCONFIGURED"
+      and M2_LEDGER.summary()["activation_state"] == "NOT_STARTED"
+      and list(M2_LEDGER.iter_events()) == [])
+
+M2_PRO_SETTINGS = m2_state.ModelSettings(
+    endpoint="https://model.example.invalid",
+    name="deepseek-v4-pro",
+    provider="DeepSeek",
+    protocol="openai_chat",
+    secret="fixture-not-a-real-key",
+)
+M2_FLASH_SETTINGS = m2_state.ModelSettings(
+    endpoint="https://model.example.invalid",
+    name="deepseek-v4-flash",
+    provider="DeepSeek",
+    protocol="openai_chat",
+    secret="fixture-not-a-real-key",
+)
+check("M2 只接受 DeepSeek V4 Pro exact identifier，Flash 不会自动成为 fallback",
+      m2_activation._model_configuration_problems(M2_PRO_SETTINGS) == []
+      and bool(m2_activation._model_configuration_problems(M2_FLASH_SETTINGS)))
+M2_BLOCK_STORE = m2_state.Store(
+    Path(tempfile.mkdtemp(prefix="zhixing-m2-block-runtime-"))
+)
+m2_activation.prepare_runtime(M2_BLOCK_STORE)
+M2_BLOCK_STORE.save_broker(m2_state.BrokerSettings(
+    remote_url="http://browser.invalid/wd/hub",
+    account="00000000",
+    password="fixture-password",
+))
+M2_BLOCK_PROBLEMS = m2_activation.configuration_problems(
+    M2_BLOCK_STORE,
+    m2_activation.experiment_ledger(
+        Path(tempfile.mkdtemp(prefix="zhixing-m2-block-archive-"))
+    ),
+    now=M2_NOW, storage_kind="", require_started=False,
+)
+check("broker credential 或未证明 named volumes 时 activation hard gate 拒绝",
+      any("broker" in item for item in M2_BLOCK_PROBLEMS)
+      and any("named volume" in item for item in M2_BLOCK_PROBLEMS))
+check("endpoint model echo 必须与 requested exact identifier 一致",
+      m2_activation._check_model_echo("deepseek-v4-pro", ["deepseek-v4-pro"])
+      == "deepseek-v4-pro"
+      and _raises(
+          m2_activation.ActivationError,
+          lambda: m2_activation._check_model_echo(
+              "deepseek-v4-pro", ["deepseek-v4-flash"]
+          ),
+      ))
+
+M2_STORE.save_model(M2_PRO_SETTINGS)
+M2_PROBE = m2_activation.ModelProbe(
+    model_echo="deepseek-v4-pro",
+    full_round_wall_clock_seconds=123.456,
+    object_count=3,
+)
+M2_METADATA = m2_activation._metadata(
+    settings=M2_PRO_SETTINGS,
+    probe=M2_PROBE,
+    started_at=M2_NOW,
+    ledger=M2_LEDGER,
+    storage_kind=m2_activation.STORAGE_KIND_DOCKER_VOLUME,
+)
+M2_LEDGER.activate(at=M2_NOW, metadata=M2_METADATA)
+M2_STARTED = M2_LEDGER.summary()
+M2_START_EVENTS = list(M2_LEDGER.iter_events())
+check("EXPERIMENT_STARTED durable fact 包含 identity/main/model/universe/schedule/fees/benchmark",
+      len(M2_START_EVENTS) == 1
+      and M2_START_EVENTS[0]["event_type"] == "EXPERIMENT_STARTED"
+      and M2_METADATA["experiment_id"] == "llm-trading-lab-exp1"
+      and M2_METADATA["main_sha"] == m2_activation.BASELINE_MAIN_SHA
+      and M2_METADATA["model"]["exact_model_identifier"] == "deepseek-v4-pro"
+      and M2_METADATA["model_preflight"]["full_round_object_count"] == 3
+      and M2_METADATA["benchmark"]["buy_and_hold_object_id"] == "SH_510300"
+      and M2_METADATA["verification_lock"] is True)
+check("start metadata 不含 endpoint / API secret 且初始 NAV 不变",
+      "model.example.invalid" not in json.dumps(M2_METADATA)
+      and "fixture-not-a-real-key" not in json.dumps(M2_METADATA)
+      and M2_STARTED["current_cash"] == "1000.00"
+      and M2_STARTED["nav"] == "1000.00"
+      and M2_STARTED["positions"] == [])
+
+M2_LEDGER.activate(at=M2_NOW, metadata=M2_METADATA)
+M2_RESTARTED = m2_activation.experiment_ledger(M2_ARCHIVE)
+check("activation 幂等且 restart 后只重建同一个 Experiment #1",
+      len(list(M2_LEDGER.iter_events())) == 1
+      and M2_RESTARTED.summary() == M2_STARTED)
+
+M2_RUNNER = m2_daemon.build_runner(
+    M2_STORE,
+    archive_root=M2_ARCHIVE,
+    source=m2_collect.MarketCollector(store=M2_STORE, sleep=lambda _: None),
+)
+check("M2 daemon 仍为 MarketCollector + SIMULATION，BrokerAdapter provider absent",
+      isinstance(M2_RUNNER.source, m2_collect.MarketCollector)
+      and M2_RUNNER.authorization_kind is AuthorizationKind.SIMULATION
+      and M2_RUNNER.broker_provider is None
+      and runmode.VERIFICATION_LOCK is True)
+check("start fact 与 runtime model regime 一致时 daemon preflight 通过",
+      m2_daemon.preflight(
+          M2_STORE, now=M2_NOW, archive_root=M2_ARCHIVE
+      ) == ())
+
+M2_APP = m2_api.App(
+    store=M2_STORE, archive_root=M2_ARCHIVE,
+    broker_provider=None, experiment_ledger=M2_LEDGER,
+)
+M2_SWITCH_RESPONSE = m2_api.handle(
+    M2_APP,
+    m2_api.Request(
+        "PUT", "/api/settings/model",
+        body={
+            "接口地址": M2_FLASH_SETTINGS.endpoint,
+            "模型": M2_FLASH_SETTINGS.name,
+            "提供方": M2_FLASH_SETTINGS.provider,
+            "协议": M2_FLASH_SETTINGS.protocol,
+            "密钥": M2_FLASH_SETTINGS.secret,
+        },
+    ),
+)
+check("实验开始后通用 settings API 不能静默切到 Flash",
+      M2_SWITCH_RESPONSE.status == 409
+      and M2_SWITCH_RESPONSE.payload["error"]["code"]
+      == "MODEL_REGIME_CHANGE_REQUIRED"
+      and M2_STORE.model() == M2_PRO_SETTINGS)
+
+M2_FLASH_REGIME = {
+    "provider": "DeepSeek", "model_family": "DeepSeek V4",
+    "variant": "Flash", "protocol": "openai_chat",
+    "exact_model_identifier": "deepseek-v4-flash", "model_echo": None,
+}
+M2_LEDGER.record_model_regime_change(
+    at=datetime(2026, 8, 18, 9, 0, tzinfo=_M2ZoneInfo("Asia/Shanghai")),
+    from_model=M2_METADATA["model"], to_model=M2_FLASH_REGIME,
+    reason="fixture: future Owner-authorized switch",
+)
+M2_AFTER_REGIME = M2_LEDGER.summary()
+M2_REGIME_EVENT = list(M2_LEDGER.iter_events())[-1]
+check("未来 Owner-authorized model regime fact 不重置 ledger/NAV 并可重建",
+      M2_REGIME_EVENT["event_type"] == "MODEL_REGIME_CHANGED"
+      and M2_REGIME_EVENT["nav_at_switch"] == "1000.00"
+      and M2_AFTER_REGIME["current_cash"] == M2_STARTED["current_cash"]
+      and M2_AFTER_REGIME["nav"] == M2_STARTED["nav"]
+      and m2_activation.experiment_ledger(M2_ARCHIVE).summary()
+      == M2_AFTER_REGIME)
+check("durable regime 与 private config 漂移时 daemon fail closed，不会暗中换模型",
+      any(
+          "current_model_regime" in item
+          for item in m2_daemon.preflight(
+              M2_STORE, now=M2_NOW, archive_root=M2_ARCHIVE
+          )
+      ))
+
+M2_COMPOSE = (Path(__file__).resolve().parents[3] / "deploy" / "compose.yaml").read_text(
+    encoding="utf-8"
+)
+M2_ACTIVATE_SCRIPT = (
+    Path(__file__).resolve().parents[3] / "scripts" / "activate_experiment.sh"
+).read_text(encoding="utf-8")
+check("experiment profile 不依赖 browser，activation 先验证 baseline/verify/durable volumes",
+      "- experiment" in M2_COMPOSE
+      and "browser:\n    profiles:\n      - collector" in M2_COMPOSE
+      and '"$SCRIPT_DIR/verify.sh"' in M2_ACTIVATE_SCRIPT
+      and 'fetch --prune origin' in M2_ACTIVATE_SCRIPT
+      and "docker_named_volume" in M2_ACTIVATE_SCRIPT
+      and m2_activation.BASELINE_MAIN_SHA in M2_ACTIVATE_SCRIPT)
+
+
 print("\n=== 保证四:标的属性只有一个来源(清单),不写死在代码里 ===")
 
 CATALOG = catalog.Catalog([
