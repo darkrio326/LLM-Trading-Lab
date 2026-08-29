@@ -516,6 +516,25 @@ M1_OBJECT = catalog.TradeObject(
     "SH_510300", "SH", "510300", "M1 演示 ETF", asset_type="ETF", lot_size=100
 )
 M1_CATALOG = catalog.Catalog([M1_OBJECT])
+M1_T0_OBJECT = catalog.TradeObject(
+    "SH_510300", "SH", "510300", "M1 显式 T+0 ETF",
+    asset_type="ETF", lot_size=100, turnover_mode=catalog.TURNOVER_T0,
+)
+M1_T0_CATALOG = catalog.Catalog([M1_T0_OBJECT])
+check("股票与 ETF 缺省均保守 T+1，只有 catalog 显式声明才是 T+0",
+      M1_OBJECT.turnover_mode == catalog.TURNOVER_T1
+      and catalog.TradeObject(
+          "SH_600000", "SH", "600000", "M1 演示股票"
+      ).turnover_mode == catalog.TURNOVER_T1
+      and _raises(ValueError, lambda: catalog.TradeObject(
+          "SH_600001", "SH", "600001", "错误 T+0 股票",
+          turnover_mode=catalog.TURNOVER_T0,
+      ))
+      and catalog.from_entry({
+          "object_id": "SZ_159001", "market": "SZ", "symbol": "159001",
+          "名称": "M1 显式 T+0 ETF", "类型": catalog.KIND_TRADABLE,
+          "资产类型": "ETF", "turnover_mode": "T+0",
+      }).turnover_mode == catalog.TURNOVER_T0)
 
 
 def _m1_report(code: str, *, action="buy", qty=100, price="4.20", wtbh=None):
@@ -528,10 +547,10 @@ def _m1_report(code: str, *, action="buy", qty=100, price="4.20", wtbh=None):
     )
 
 
-def _m1_refs(engine, *, strategy: str, price: str, at=NOW):
+def _m1_refs(engine, *, strategy: str, price: str, at=NOW, catalog_value=M1_CATALOG):
     return engine.prepare_round(
         strategy_id=strategy,
-        catalog=M1_CATALOG,
+        catalog=catalog_value,
         snapshots={
             "510300": guards.ObjectSnapshot(
                 symbol="510300", last_price=Decimal(price), is_etf=True,
@@ -564,6 +583,11 @@ check("BUY simulated fill 后现金减少、position 增加",
       M1_BUY.state is paper.SyntheticOrderState.FILLED
       and M1_AFTER_BUY["current_cash"] == "595.00"
       and M1_AFTER_BUY["positions"][0]["qty"] == 100)
+check("T+1 BUY 增加 total 与 pending，但当日 sellable / available 仍为 0",
+      M1_AFTER_BUY["positions"][0]["qty"] == 100
+      and M1_AFTER_BUY["positions"][0]["sellable_qty"] == 0
+      and M1_AFTER_BUY["positions"][0]["pending_settlement_qty"] == 100
+      and M1_AFTER_BUY["positions"][0]["available_qty"] == 0)
 check("BUY fee 按 configurable minimum commission 扣除",
       M1_BUY.fee == Decimal("5.00")
       and M1_AFTER_BUY["cumulative_fees"] == "5.00")
@@ -605,14 +629,74 @@ M1_SELL_REFS = _m1_refs(
     M1_ENGINE, strategy="m1-round-2", price="4.50",
     at=datetime(2026, 8, 17, 11, 0, 0),
 )
-M1_SELL = M1_ENGINE.submit(
-    _m1_report("m1-sell", action="sell", price="4.40").order,
+M1_SAME_DAY_SELL = M1_ENGINE.submit(
+    _m1_report("m1-same-day-sell", action="sell", price="4.40").order,
     strategy_id="m1-round-2", object_id="SH_510300",
     catalog=M1_CATALOG, references=M1_SELL_REFS,
     now=datetime(2026, 8, 17, 11, 0, 0),
 )
+M1_AFTER_SAME_DAY_SELL = M1_LEDGER.summary()
+check("默认 T+1 ETF 510300 当日 BUY 后 SELL 被 venue 拒绝",
+      M1_SAME_DAY_SELL.state is paper.SyntheticOrderState.REJECTED
+      and M1_AFTER_SAME_DAY_SELL["positions"][0]["qty"] == 100
+      and M1_AFTER_SAME_DAY_SELL["positions"][0]["available_qty"] == 0
+      and M1_AFTER_SAME_DAY_SELL["positions"][0]["pending_settlement_qty"] == 100)
+
+M1_NEXT_DAY = datetime(2026, 8, 18, 10, 0, 0)
+M1_NEXT_DAY_REFS = _m1_refs(
+    M1_ENGINE, strategy="m1-round-3", price="4.50", at=M1_NEXT_DAY,
+)
+M1_AFTER_SETTLEMENT = M1_LEDGER.summary()
+check("下一有效交易日首次 observation 追加 settlement fact 并解锁 sellable",
+      M1_AFTER_SETTLEMENT["positions"][0]["qty"] == 100
+      and M1_AFTER_SETTLEMENT["positions"][0]["sellable_qty"] == 100
+      and M1_AFTER_SETTLEMENT["positions"][0]["pending_settlement_qty"] == 0
+      and M1_AFTER_SETTLEMENT["positions"][0]["available_qty"] == 100
+      and sum(
+          event["event_type"] == "SETTLEMENT_RELEASED"
+          for event in M1_LEDGER.iter_events()
+      ) == 1)
+M1_SETTLED_EVENT_COUNT = len(list(M1_LEDGER.iter_events()))
+M1_RESTARTED_AFTER_SETTLEMENT = paper.ExperimentLedger(M1_ROOT)
+_m1_refs(
+    paper.PaperExecutionEngine(M1_RESTARTED_AFTER_SETTLEMENT),
+    strategy="m1-round-3", price="4.50", at=M1_NEXT_DAY,
+)
+check("restart reconstruction 保持 total / sellable / pending 且不会重复解冻",
+      M1_RESTARTED_AFTER_SETTLEMENT.summary() == M1_AFTER_SETTLEMENT
+      and len(list(M1_RESTARTED_AFTER_SETTLEMENT.iter_events()))
+      == M1_SETTLED_EVENT_COUNT)
+
+M1_OPEN_SELL = M1_ENGINE.submit(
+    _m1_report("m1-open-sell", action="sell", price="4.60").order,
+    strategy_id="m1-round-3", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_NEXT_DAY_REFS, now=M1_NEXT_DAY,
+)
+check("OPEN SELL reservation 只占用已解冻 sellable qty",
+      M1_OPEN_SELL.state is paper.SyntheticOrderState.OPEN
+      and M1_LEDGER.summary()["positions"][0]["sellable_qty"] == 100
+      and M1_LEDGER.summary()["positions"][0]["available_qty"] == 0)
+M1_CANCEL_OPEN_SELL = M1_ENGINE.submit(
+    _m1_report(
+        "m1-cancel-open-sell", action="cancel", qty=None, price=None,
+        wtbh=M1_OPEN_SELL.order_reference,
+    ).order,
+    strategy_id="m1-round-3", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_NEXT_DAY_REFS, now=M1_NEXT_DAY,
+)
+check("CANCEL OPEN SELL 后 reservation 释放但持仓 settlement 状态不变",
+      M1_CANCEL_OPEN_SELL.state is paper.SyntheticOrderState.CANCELLED
+      and M1_LEDGER.summary()["positions"][0]["sellable_qty"] == 100
+      and M1_LEDGER.summary()["positions"][0]["available_qty"] == 100
+      and M1_LEDGER.summary()["positions"][0]["pending_settlement_qty"] == 0)
+
+M1_SELL = M1_ENGINE.submit(
+    _m1_report("m1-sell", action="sell", price="4.40").order,
+    strategy_id="m1-round-3", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_NEXT_DAY_REFS, now=M1_NEXT_DAY,
+)
 M1_AFTER_SELL = M1_LEDGER.summary()
-check("SELL 后 position 减少且 realized P&L 正确",
+check("T+1 position 解冻后 SELL 才成交且 realized P&L 正确",
       M1_SELL.state is paper.SyntheticOrderState.FILLED
       and M1_AFTER_SELL["positions"] == []
       and M1_AFTER_SELL["realized_pnl"] == "40.00")
@@ -625,14 +709,43 @@ M1_DUPLICATE_SELL = paper.PaperExecutionEngine(
     paper.ExperimentLedger(M1_ROOT)
 ).submit(
     _m1_report("m1-sell", action="sell", price="4.40").order,
-    strategy_id="m1-round-2", object_id="SH_510300",
-    catalog=M1_CATALOG, references=M1_SELL_REFS,
-    now=datetime(2026, 8, 17, 11, 0, 0),
+    strategy_id="m1-round-3", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_NEXT_DAY_REFS, now=M1_NEXT_DAY,
 )
 check("restart 后 duplicate SELL 不会双减 position 或重复计入 P&L",
       M1_DUPLICATE_SELL.state is paper.SyntheticOrderState.FILLED
       and M1_LEDGER.summary() == M1_AFTER_SELL
       and len(list(M1_LEDGER.iter_events())) == M1_SELL_EVENT_COUNT)
+
+M1_T0_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-t0-"))
+M1_T0_LEDGER = paper.ExperimentLedger(M1_T0_ROOT)
+M1_T0_ENGINE = paper.PaperExecutionEngine(M1_T0_LEDGER)
+M1_T0_BUY_REFS = _m1_refs(
+    M1_T0_ENGINE, strategy="m1-t0-buy", price="4.00",
+    catalog_value=M1_T0_CATALOG,
+)
+M1_T0_BUY = M1_T0_ENGINE.submit(
+    _m1_report("m1-t0-buy").order,
+    strategy_id="m1-t0-buy", object_id="SH_510300",
+    catalog=M1_T0_CATALOG, references=M1_T0_BUY_REFS, now=NOW,
+)
+M1_T0_SELL_AT = datetime(2026, 8, 17, 11, 0, 0)
+M1_T0_SELL_REFS = _m1_refs(
+    M1_T0_ENGINE, strategy="m1-t0-sell", price="4.50", at=M1_T0_SELL_AT,
+    catalog_value=M1_T0_CATALOG,
+)
+M1_T0_BEFORE_SELL = M1_T0_LEDGER.summary()
+M1_T0_SELL = M1_T0_ENGINE.submit(
+    _m1_report("m1-t0-sell", action="sell", price="4.40").order,
+    strategy_id="m1-t0-sell", object_id="SH_510300",
+    catalog=M1_T0_CATALOG, references=M1_T0_SELL_REFS, now=M1_T0_SELL_AT,
+)
+check("catalog 显式 T+0 ETF 允许同日 BUY 后 SELL",
+      M1_T0_BUY.state is paper.SyntheticOrderState.FILLED
+      and M1_T0_BEFORE_SELL["positions"][0]["sellable_qty"] == 100
+      and M1_T0_BEFORE_SELL["positions"][0]["pending_settlement_qty"] == 0
+      and M1_T0_SELL.state is paper.SyntheticOrderState.FILLED
+      and M1_T0_LEDGER.summary()["positions"] == [])
 
 M1_MARK_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-mark-"))
 M1_MARK_LEDGER = paper.ExperimentLedger(M1_MARK_ROOT)
@@ -755,6 +868,11 @@ M1_POSITION_CONTEXT = M1_MARK_LEDGER.model_position_context("510300")
 check("synthetic cash / position / activity 可投影进现有 model account context",
       M1_CONTEXT["账户"]["可用资金"] == "595.00"
       and M1_POSITION_CONTEXT["数量"] == 100
+      and M1_POSITION_CONTEXT["可用数量"] == 0
+      and M1_POSITION_CONTEXT["冻结数量"] == 100
+      and M1_CONTEXT["账户"]["持仓列表"][0]["持仓数量"] == 100
+      and M1_CONTEXT["账户"]["持仓列表"][0]["可用数量"] == 0
+      and M1_CONTEXT["账户"]["持仓列表"][0]["冻结数量"] == 100
       and M1_POSITION_CONTEXT["成本价"] == "4.05"
       and M1_CONTEXT["当日流水"]["条数"] >= 1)
 
@@ -766,6 +884,7 @@ M1_POLICY_DECISION = POLICY.evaluate(
 check("ExperimentPolicy 读取 synthetic snapshot 而非 real broker account",
       M1_POLICY_SNAPSHOT.net_equity_cny == Decimal("895.00")
       and M1_POLICY_SNAPSHOT.available_cash_cny == Decimal("595.00")
+      and M1_POLICY_SNAPSHOT.symbol_position_qty == {"510300": 100}
       and M1_POLICY_DECISION.result is experiment.PolicyResult.REJECT)
 
 M1_REQUIRED_FACT_FIELDS = {
@@ -1518,17 +1637,23 @@ NEW = call("POST", "/api/objects", body={
     "类型": "交易标的", "资产类型": "ETF",
 })
 check("新增标的,object_id 由后端按市场_代码生成",
-      NEW.payload["data"]["object_id"] == "SH_510300")
+      NEW.payload["data"]["object_id"] == "SH_510300"
+      and NEW.payload["data"]["turnover_mode"] == "T+1")
 check("采集层没接时持仓是 null,不是 0(「空仓」和「没采到」必须分得开)",
       NEW.payload["data"]["持仓"] is None)
-check("提交多余字段不被采纳(可写字段只有五个)",
+check("提交多余采集字段不被采纳(catalog 可写字段不含持仓)",
       call("POST", "/api/objects", body={
           "market": "SZ", "symbol": "159941", "名称": "演示海外乙ETF",
-          "类型": "行情对象", "资产类型": "ETF", "持仓": {"持仓数量": 99999},
+          "类型": "行情对象", "资产类型": "ETF", "turnover_mode": "T+0",
+          "持仓": {"持仓数量": 99999},
       }).payload["data"]["持仓"] is None)
 check("清单里两个都在,类型区分得开",
       {o["object_id"]: o["类型"] for o in call("GET", "/api/objects").payload["data"]}
       == {"SH_510300": "交易标的", "SZ_159941": "行情对象"})
+check("catalog turnover_mode 缺省 T+1、显式 T+0 且存盘重读不丢",
+      {o["object_id"]: o["turnover_mode"]
+       for o in call("GET", "/api/objects").payload["data"]}
+      == {"SH_510300": "T+1", "SZ_159941": "T+0"})
 
 check("改名字改得动",
       call("PUT", "/api/objects/SH_510300", body={
@@ -3221,7 +3346,7 @@ check("**quote_only 不含宏观对象**——两者采集路径不同,"
       and len(_M_CAT.background) == 2 and len(_M_CAT.tradable) == 1)
 
 # 清单存回去再读出来,类型不能丢。save_catalog 是**整份重写**,
-# 它只写七个字段——宏观对象要能从这七个字段里原样还原。
+# 它只写 catalog 字段——宏观对象要能从这些字段里原样还原。
 _M_STORE = state.Store(Path(tempfile.mkdtemp(prefix="zhixing-macro-")))
 _M_STORE.save_catalog(list(_M_CAT.objects))
 _M_BACK = _M_STORE.catalog()

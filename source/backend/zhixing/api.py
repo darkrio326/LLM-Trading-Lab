@@ -305,6 +305,7 @@ def _object_view(obj: catalog_mod.TradeObject) -> dict[str, Any]:
         "类型": obj.kind,
         "资产类型": obj.asset_type,
         "交易单位": obj.lot_size,
+        "turnover_mode": obj.turnover_mode,
         **_UNCOLLECTED,
     }
 
@@ -349,7 +350,12 @@ def put_object(app: App, req: Request, object_id: str) -> Response:
                 f"历史归档里的引用会失配。请删除后重新添加。",
             )
 
-    draft = {"market": current.market, "symbol": current.symbol, **body}
+    draft = {
+        "market": current.market,
+        "symbol": current.symbol,
+        "turnover_mode": current.turnover_mode,
+        **body,
+    }
     obj, failures = catalog_mod.validate_draft(draft)   # 不传 existing:自己撞自己不算重复
     if obj is None:
         problems = tuple((f.code, f.message) for f in failures)

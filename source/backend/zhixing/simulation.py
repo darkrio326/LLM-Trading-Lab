@@ -20,7 +20,7 @@ import re
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from pathlib import Path
@@ -28,8 +28,16 @@ from typing import Any, Iterator, Mapping, Sequence
 
 import fcntl
 
-from . import archive, experiment
-from .catalog import Catalog, TradeObject, VALID_ASSET_TYPES, VALID_MARKETS
+from . import archive, experiment, tradingdays
+from .catalog import (
+    Catalog,
+    TradeObject,
+    TURNOVER_T0,
+    TURNOVER_T1,
+    VALID_ASSET_TYPES,
+    VALID_MARKETS,
+    VALID_TURNOVER_MODES,
+)
 from .guards import ObjectSnapshot, ValidatedOrder
 
 
@@ -228,6 +236,11 @@ class SimulationVenueRules:
 
     supported_markets: frozenset[str] = VALID_MARKETS
     supported_asset_types: frozenset[str] = VALID_ASSET_TYPES
+    supported_turnover_modes: frozenset[str] = VALID_TURNOVER_MODES
+
+    def buy_is_immediately_sellable(self, instrument: TradeObject) -> bool:
+        """Only catalog-declared T+0 instruments unlock a BUY on its trade date."""
+        return instrument.asset_type == "ETF" and instrument.turnover_mode == TURNOVER_T0
 
     def validate(
         self,
@@ -254,6 +267,16 @@ class SimulationVenueRules:
             reasons.append({
                 "code": "UNSUPPORTED_ASSET_TYPE",
                 "message": f"M1 synthetic venue 不支持资产类型 {instrument.asset_type}。",
+            })
+        if instrument.turnover_mode not in self.supported_turnover_modes:
+            reasons.append({
+                "code": "UNSUPPORTED_TURNOVER_MODE",
+                "message": f"M1 synthetic venue 不支持回转制度 {instrument.turnover_mode}。",
+            })
+        elif instrument.turnover_mode == TURNOVER_T0 and instrument.asset_type != "ETF":
+            reasons.append({
+                "code": "T0_REQUIRES_ETF",
+                "message": "M1 synthetic venue 只允许 catalog 中的 ETF 显式声明 T+0。",
             })
         if instrument.lot_size <= 0:
             reasons.append({
@@ -331,9 +354,18 @@ def _position_entry(
     *,
     instrument: TradeObject,
     qty: int,
+    sellable_qty: int,
+    pending_settlements: Sequence[Mapping[str, Any]],
     avg_cost: Decimal,
     last_price: Decimal,
 ) -> dict[str, Any]:
+    pending = [copy.deepcopy(dict(item)) for item in pending_settlements]
+    pending_qty = sum(int(item.get("qty") or 0) for item in pending)
+    if qty < 0 or sellable_qty < 0 or sellable_qty + pending_qty != qty:
+        raise ExperimentLedgerError(
+            "position settlement invariant broken: "
+            f"qty={qty} sellable={sellable_qty} pending={pending_qty}"
+        )
     cost_basis = avg_cost * qty
     market_value = last_price * qty
     return {
@@ -342,7 +374,11 @@ def _position_entry(
         "symbol": instrument.symbol,
         "name": instrument.name,
         "asset_type": instrument.asset_type,
+        "turnover_mode": instrument.turnover_mode,
         "qty": qty,
+        "sellable_qty": sellable_qty,
+        "pending_settlement_qty": pending_qty,
+        "pending_settlements": pending,
         "average_cost": _text(avg_cost),
         "cost_basis": _text(_money(cost_basis)),
         "last_price": _text(last_price),
@@ -410,7 +446,10 @@ def _available_position(
     *, excluding_instruction: str | None = None,
 ) -> int:
     raw = (state.get("positions") or {}).get(symbol) or {}
-    qty = int(raw.get("qty") or 0)
+    sellable_qty = min(
+        int(raw.get("qty") or 0),
+        max(0, int(raw.get("sellable_qty") or 0)),
+    )
     reserved = sum(
         int(order.get("qty") or 0)
         for code, order in orders.items()
@@ -419,7 +458,7 @@ def _available_position(
         and order.get("action") == "sell"
         and order.get("symbol") == symbol
     )
-    return max(0, qty - reserved)
+    return max(0, sellable_qty - reserved)
 
 
 class _LedgerTransaction:
@@ -638,6 +677,7 @@ class ExperimentLedger:
                 "证券名称": row["name"],
                 "持仓数量": row["qty"],
                 "可用数量": row["available_qty"],
+                "冻结数量": row["qty"] - row["available_qty"],
                 "成本价": row["average_cost"],
                 "市值": row["market_value"],
                 "浮动盈亏": row["unrealized_pnl"],
@@ -757,6 +797,7 @@ def _public_order(order: Mapping[str, Any]) -> dict[str, Any]:
         for key in (
             "strategy_id", "instruction_code", "order_reference", "object_id", "market",
             "symbol", "name", "asset_type", "action", "qty", "model_limit_price",
+            "turnover_mode",
             "simulated_execution_price", "state", "fill_qty", "fee", "created_at",
             "updated_at", "expires_at", "reasons", "target_order_reference",
         )
@@ -813,10 +854,97 @@ class PaperExecutionEngine:
     ) -> Mapping[str, QuoteReference]:
         self.ledger.initialize(at=now)
         self.expire_due(now=now)
+        self.release_due_settlements(strategy_id=strategy_id, now=now)
         proposed = self.quote_references(catalog, snapshots, observed_at=now)
         references = self._observe_market(strategy_id=strategy_id, references=proposed, now=now)
         self._fill_open_orders(catalog=catalog, references=references, now=now)
         return references
+
+    def release_due_settlements(self, *, strategy_id: str, now: datetime) -> int:
+        """Release prior-trading-day BUY lots at this valid round observation.
+
+        A calendar day alone never advances settlement.  The release is attempted only while an
+        actual simulation round is being prepared, and the existing trading calendar must confirm
+        that the observed day is open.  The resulting complete state is one durable ledger fact.
+        """
+        if not tradingdays.is_trading_day(now.date()):
+            return 0
+
+        instruction_code = f"experiment:settlement:{now.date().isoformat()}"
+        with self.ledger._transaction() as tx:
+            if any(
+                event.get("instruction_code") == instruction_code
+                and event.get("event_type") == "SETTLEMENT_RELEASED"
+                for event in tx.events
+            ):
+                return 0
+
+            state = copy.deepcopy(tx.state)
+            releases: list[dict[str, Any]] = []
+            for symbol, position in sorted((state.get("positions") or {}).items()):
+                pending = position.get("pending_settlements") or []
+                remaining: list[dict[str, Any]] = []
+                released_qty = 0
+                released_lots: list[dict[str, Any]] = []
+                for raw in pending:
+                    lot = copy.deepcopy(dict(raw))
+                    try:
+                        trade_date = date.fromisoformat(str(lot.get("trade_date") or ""))
+                    except ValueError as exc:
+                        raise ExperimentLedgerError(
+                            f"pending settlement 缺少合法 trade_date:{symbol}"
+                        ) from exc
+                    if trade_date < now.date():
+                        released_qty += int(lot.get("qty") or 0)
+                        released_lots.append(lot)
+                    else:
+                        remaining.append(lot)
+                if released_qty <= 0:
+                    continue
+                position["sellable_qty"] = int(position.get("sellable_qty") or 0) + released_qty
+                position["pending_settlements"] = remaining
+                position["pending_settlement_qty"] = sum(
+                    int(item.get("qty") or 0) for item in remaining
+                )
+                releases.append({
+                    "object_id": position.get("object_id"),
+                    "symbol": symbol,
+                    "qty": released_qty,
+                    "lots": released_lots,
+                    "resulting_sellable_qty": position["sellable_qty"],
+                    "resulting_pending_settlement_qty": position["pending_settlement_qty"],
+                })
+
+            if not releases:
+                return 0
+
+            _revalue(state)
+            tx.append(_event(
+                event_type="SETTLEMENT_RELEASED",
+                strategy_id=strategy_id,
+                instruction_code=instruction_code,
+                object_id="",
+                action="settle",
+                qty=sum(int(item["qty"]) for item in releases),
+                model_limit_price=None,
+                execution_price=None,
+                order_state="SETTLED",
+                fill_qty=0,
+                fee=Decimal("0"),
+                cash_delta=Decimal("0"),
+                position_delta=0,
+                realized_delta=Decimal("0"),
+                resulting_position=None,
+                at=now,
+                state=state,
+                orders=tx.orders,
+                extra={
+                    "settlement_date": now.date().isoformat(),
+                    "settlement_releases": releases,
+                    "settlement_model": "T+1 releases at first observation on a later valid trading day",
+                },
+            ))
+            return sum(int(item["qty"]) for item in releases)
 
     def _observe_market(
         self,
@@ -955,6 +1083,7 @@ class PaperExecutionEngine:
             "name": order.name,
             "asset_type": instrument.asset_type if instrument is not None else "",
             "lot_size": instrument.lot_size if instrument is not None else 0,
+            "turnover_mode": instrument.turnover_mode if instrument is not None else "",
             "action": order.action,
             "qty": order.qty,
             "model_limit_price": _text(order.limit_price),
@@ -1008,12 +1137,32 @@ class PaperExecutionEngine:
                     message=f"触价时需要 {required} CNY，可用 synthetic cash 为 {available} CNY。",
                 )
             prior_qty = int((prior or {}).get("qty") or 0)
+            prior_sellable = int((prior or {}).get("sellable_qty") or 0)
+            pending_settlements = [
+                copy.deepcopy(dict(item))
+                for item in ((prior or {}).get("pending_settlements") or [])
+            ]
             prior_basis = _decimal((prior or {}).get("average_cost")) * prior_qty
             new_qty = prior_qty + qty
             new_avg = (prior_basis + notional + fee) / new_qty
+            if self.rules.buy_is_immediately_sellable(instrument):
+                new_sellable = prior_sellable + qty
+            else:
+                new_sellable = prior_sellable
+                pending_settlements.append({
+                    "instruction_code": code,
+                    "trade_date": now.date().isoformat(),
+                    "qty": qty,
+                    "turnover_mode": TURNOVER_T1,
+                })
             state["cash"] = _text(_money(cash_before - required))
             positions[instrument.symbol] = _position_entry(
-                instrument=instrument, qty=new_qty, avg_cost=new_avg, last_price=price
+                instrument=instrument,
+                qty=new_qty,
+                sellable_qty=new_sellable,
+                pending_settlements=pending_settlements,
+                avg_cost=new_avg,
+                last_price=price,
             )
             cash_delta = -required
         else:
@@ -1026,6 +1175,11 @@ class PaperExecutionEngine:
                     message=f"触价时拟卖出 {qty}，synthetic 可卖数量为 {available_qty}。",
                 )
             prior_qty = int(prior.get("qty") or 0)
+            prior_sellable = int(prior.get("sellable_qty") or 0)
+            pending_settlements = [
+                copy.deepcopy(dict(item))
+                for item in (prior.get("pending_settlements") or [])
+            ]
             avg_cost = _decimal(prior.get("average_cost"))
             proceeds = _money(notional - fee)
             realized_delta = _money(proceeds - avg_cost * qty)
@@ -1033,7 +1187,12 @@ class PaperExecutionEngine:
             state["cash"] = _text(_money(cash_before + proceeds))
             if new_qty:
                 positions[instrument.symbol] = _position_entry(
-                    instrument=instrument, qty=new_qty, avg_cost=avg_cost, last_price=price
+                    instrument=instrument,
+                    qty=new_qty,
+                    sellable_qty=prior_sellable - qty,
+                    pending_settlements=pending_settlements,
+                    avg_cost=avg_cost,
+                    last_price=price,
                 )
             else:
                 positions.pop(instrument.symbol, None)
@@ -1067,6 +1226,7 @@ class PaperExecutionEngine:
                 "simulated_notional": _text(notional),
                 "fee_breakdown": fee_quote.as_entry(),
                 "market_reference": reference.as_entry(),
+                "turnover_mode": instrument.turnover_mode,
                 "fill_model": "marketable DAY limit fills once at current observed reference price",
             },
         )
@@ -1254,6 +1414,7 @@ def _event_for_order(
             "symbol": order.get("symbol"),
             "name": order.get("name"),
             "asset_type": order.get("asset_type"),
+            "turnover_mode": order.get("turnover_mode"),
             "reasons": copy.deepcopy(order.get("reasons") or []),
             **dict(extra or {}),
         },

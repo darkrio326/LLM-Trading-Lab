@@ -13,7 +13,7 @@ M1 的资金事实权威是 `ExperimentLedger`，而不是任何真实券商账�
 账户派生状态包括：
 
 - current/available cash；
-- positions、average cost、market value；
+- positions（total/sellable/pending settlement）、average cost、market value；
 - realized/unrealized P&L；
 - NAV、high-water mark、current/max drawdown；
 - cumulative fees 与 turnover；
@@ -34,10 +34,21 @@ proposed order
 ```
 
 - BUY 只支持 catalog 明确标记为可交易、市场为 SH/SZ、资产类型为股票/ETF 且 lot-size 合法的标的；数量必须是 catalog 买入交易单位的整数倍。信息不足的品种 fail closed，不猜测。
-- SELL 不得超过 synthetic available position；不会形成 short position。
+- SELL 不得超过 synthetic sellable position；OPEN SELL reservation 也只占用 sellable qty，不会把待交收持仓当成可卖持仓，也不会形成 short position。
 - BUY 必须有足够 synthetic available cash 覆盖成交金额和模拟费用。OPEN BUY 按模型 limit price 加费用预留现金；OPEN SELL 预留可卖数量。
 - CANCEL 只能关闭存在且仍为 OPEN 的 synthetic order。
 - venue 不会修改模型的 qty 或 limit price。不可成交就是 OPEN、REJECTED 或 EXPIRED，不会自动缩量或改价。
+
+### Settlement / turnover assumptions
+
+回转制度是 `SimulationVenueRules` 的市场机制，不属于 `ExperimentPolicy`。catalog 的 `turnover_mode` 只接受 `T+1` 或 `T+0`：
+
+- 为兼容旧 catalog，股票和 ETF 缺失该字段时均保守按 `T+1`；不能仅凭 `asset_type=ETF` 推断 T+0。
+- 只有 catalog 明确声明 `turnover_mode="T+0"` 的 ETF，BUY fill 后才立即增加 sellable qty。
+- `T+1` BUY fill 当日只增加 total qty，并把该 lot 记入带成交日和 `instruction_code` 的 pending settlement；模型会看到总持仓、可用数量和冻结数量，例如“持有 100、可用 0、冻结 100”。
+- settlement 不靠自然日定时猜测。仅当后续一个真实 simulation round 的 observation 日期被现有交易日历确认是有效交易日时，ledger 才追加一次 `SETTLEMENT_RELEASED` fact，将此前交易日的 pending qty 转为 sellable。周末、休市日和同日重启不会提前解冻。
+
+每个持仓事实保存 `qty`、`sellable_qty`、`pending_settlement_qty` 和 `pending_settlements`；完整状态随 append-only event 持久化，所以重启可重建相同的 total/sellable/pending 状态。`ExperimentPolicy` 的 position/exposure 始终按 total qty 计算，SELL 可成交性则只按扣除 OPEN SELL reservation 后的 sellable qty 计算。
 
 ### Deterministic fill assumptions
 
@@ -65,7 +76,7 @@ M1 不模拟订单簿深度。每轮仅使用该轮已采集、当日有效且�
 
 ### Mark-to-market, model context and benchmarks
 
-每轮在调用 LLM 前，paper engine 会先用该轮可获得的 quote 更新持仓市值、未实现盈亏、NAV、high-water mark 和 drawdown。然后将 ledger 中的现金、持仓、可用数量、成本、市值和当日 synthetic activity 映射到现有 account/context contract。这保证模型下一轮看到自己前面的模拟交易结果，而不是每轮重置为 1,000 CNY。prompt 文本不变。
+每轮在调用 LLM 前，paper engine 会先处理到期 settlement，再用该轮可获得的 quote 更新持仓市值、未实现盈亏、NAV、high-water mark 和 drawdown。然后将 ledger 中的现金、总持仓、可用/冻结数量、成本、市值和当日 synthetic activity 映射到现有 account/context contract。这保证模型下一轮看到自己前面的模拟交易结果，而不是每轮重置为 1,000 CNY。prompt 文本不变。
 
 `ExperimentPolicy` 的 net equity、available cash、deployed capital、symbol exposure 和 position qty 同样来自 ledger projection；`Store.account()` 中是否存在旧的真实账户快照不影响 M1 策略上下文、policy 或账本。
 
