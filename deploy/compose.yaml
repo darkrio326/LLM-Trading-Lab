@@ -155,6 +155,8 @@ services:
       test:
         - CMD
         - wget
+        - -Y
+        - "off"
         - -qO
         - /dev/null
         - http://127.0.0.1:8080/api/status
