@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import tempfile
@@ -14,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from zhixing import archive, catalog, context, experiment, guards, history, llm, model, prompts, runmode, runner
+from zhixing import simulation as paper
 from zhixing.broker import BrokerError
 from zhixing.execution import (
     Authorization, AuthorizationKind, ExecutionState, Outcome, execute,
@@ -506,6 +508,426 @@ try:
 finally:
     runmode.VERIFICATION_LOCK = _m0_lock
     runmode.set_unattended(False, changed_by="smoke", reason="M0 safety block cleanup")
+
+
+print("\n=== M1:isolated ExperimentLedger、paper venue 与 restart safety ===")
+
+M1_OBJECT = catalog.TradeObject(
+    "SH_510300", "SH", "510300", "M1 演示 ETF", asset_type="ETF", lot_size=100
+)
+M1_CATALOG = catalog.Catalog([M1_OBJECT])
+M1_T0_OBJECT = catalog.TradeObject(
+    "SH_510300", "SH", "510300", "M1 显式 T+0 ETF",
+    asset_type="ETF", lot_size=100, turnover_mode=catalog.TURNOVER_T0,
+)
+M1_T0_CATALOG = catalog.Catalog([M1_T0_OBJECT])
+check("股票与 ETF 缺省均保守 T+1，只有 catalog 显式声明才是 T+0",
+      M1_OBJECT.turnover_mode == catalog.TURNOVER_T1
+      and catalog.TradeObject(
+          "SH_600000", "SH", "600000", "M1 演示股票"
+      ).turnover_mode == catalog.TURNOVER_T1
+      and _raises(ValueError, lambda: catalog.TradeObject(
+          "SH_600001", "SH", "600001", "错误 T+0 股票",
+          turnover_mode=catalog.TURNOVER_T0,
+      ))
+      and catalog.from_entry({
+          "object_id": "SZ_159001", "market": "SZ", "symbol": "159001",
+          "名称": "M1 显式 T+0 ETF", "类型": catalog.KIND_TRADABLE,
+          "资产类型": "ETF", "turnover_mode": "T+0",
+      }).turnover_mode == catalog.TURNOVER_T0)
+
+
+def _m1_report(code: str, *, action="buy", qty=100, price="4.20", wtbh=None):
+    return guards.validate(
+        guards.ProposedOrder(
+            code, action, "SH", "510300", "M1 演示 ETF",
+            qty=qty, limit_price=price, wtbh=wtbh,
+        ),
+        guards.ValidationContext(account=None, objects={}, now=NOW),
+    )
+
+
+def _m1_refs(engine, *, strategy: str, price: str, at=NOW, catalog_value=M1_CATALOG):
+    return engine.prepare_round(
+        strategy_id=strategy,
+        catalog=catalog_value,
+        snapshots={
+            "510300": guards.ObjectSnapshot(
+                symbol="510300", last_price=Decimal(price), is_etf=True,
+                quote_is_today=True, lot_size=100,
+            )
+        },
+        now=at,
+    )
+
+
+M1_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-ledger-"))
+M1_LEDGER = paper.ExperimentLedger(M1_ROOT)
+M1_LEDGER.initialize(at=NOW)
+M1_INITIAL = M1_LEDGER.summary()
+check("M1 初始账户 = 1000 cash / 0 position / NAV 1000",
+      M1_INITIAL["current_cash"] == "1000.00"
+      and M1_INITIAL["nav"] == "1000.00"
+      and M1_INITIAL["positions"] == []
+      and list(M1_LEDGER.iter_events())[0]["event_type"] == "INITIALIZED")
+
+M1_ENGINE = paper.PaperExecutionEngine(M1_LEDGER)
+M1_REFS = _m1_refs(M1_ENGINE, strategy="m1-round-1", price="4.00")
+M1_BUY = M1_ENGINE.submit(
+    _m1_report("m1-buy").order,
+    strategy_id="m1-round-1", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_REFS, now=NOW,
+)
+M1_AFTER_BUY = M1_LEDGER.summary()
+check("BUY simulated fill 后现金减少、position 增加",
+      M1_BUY.state is paper.SyntheticOrderState.FILLED
+      and M1_AFTER_BUY["current_cash"] == "595.00"
+      and M1_AFTER_BUY["positions"][0]["qty"] == 100)
+check("T+1 BUY 增加 total 与 pending，但当日 sellable / available 仍为 0",
+      M1_AFTER_BUY["positions"][0]["qty"] == 100
+      and M1_AFTER_BUY["positions"][0]["sellable_qty"] == 0
+      and M1_AFTER_BUY["positions"][0]["pending_settlement_qty"] == 100
+      and M1_AFTER_BUY["positions"][0]["available_qty"] == 0)
+check("BUY fee 按 configurable minimum commission 扣除",
+      M1_BUY.fee == Decimal("5.00")
+      and M1_AFTER_BUY["cumulative_fees"] == "5.00")
+M1_STOCK_SELL_FEE = M1_LEDGER.fee_model.quote(
+    action="sell", asset_type="股票", notional=Decimal("600")
+)
+M1_ETF_SELL_FEE = M1_LEDGER.fee_model.quote(
+    action="sell", asset_type="ETF", notional=Decimal("600")
+)
+check("SimulationFeeModel 对股票 sell-side taxes/fees 与 ETF 分类计费",
+      M1_STOCK_SELL_FEE.total == Decimal("5.31")
+      and M1_ETF_SELL_FEE.total == Decimal("5.00"))
+
+M1_EVENT_COUNT = len(list(M1_LEDGER.iter_events()))
+M1_DUPLICATE = M1_ENGINE.submit(
+    _m1_report("m1-buy").order,
+    strategy_id="m1-round-1", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_REFS, now=NOW,
+)
+check("duplicate instruction 不重复扣现金或增加 position",
+      M1_DUPLICATE.state is paper.SyntheticOrderState.FILLED
+      and M1_LEDGER.summary() == M1_AFTER_BUY
+      and len(list(M1_LEDGER.iter_events())) == M1_EVENT_COUNT)
+
+M1_RESTARTED = paper.ExperimentLedger(M1_ROOT)
+M1_RESTARTED_ENGINE = paper.PaperExecutionEngine(M1_RESTARTED)
+M1_RESTART_BUY_EVENTS = len(list(M1_RESTARTED.iter_events()))
+M1_RESTART_BUY = M1_RESTARTED_ENGINE.submit(
+    _m1_report("m1-buy").order,
+    strategy_id="m1-round-1", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_REFS, now=NOW,
+)
+check("restart 后 retry 同一 BUY 不会双扣现金或双增 position",
+      M1_RESTART_BUY.state is paper.SyntheticOrderState.FILLED
+      and M1_RESTARTED.summary() == M1_AFTER_BUY
+      and len(list(M1_RESTARTED.iter_events())) == M1_RESTART_BUY_EVENTS)
+
+M1_SELL_REFS = _m1_refs(
+    M1_ENGINE, strategy="m1-round-2", price="4.50",
+    at=datetime(2026, 8, 17, 11, 0, 0),
+)
+M1_SAME_DAY_SELL = M1_ENGINE.submit(
+    _m1_report("m1-same-day-sell", action="sell", price="4.40").order,
+    strategy_id="m1-round-2", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_SELL_REFS,
+    now=datetime(2026, 8, 17, 11, 0, 0),
+)
+M1_AFTER_SAME_DAY_SELL = M1_LEDGER.summary()
+check("默认 T+1 ETF 510300 当日 BUY 后 SELL 被 venue 拒绝",
+      M1_SAME_DAY_SELL.state is paper.SyntheticOrderState.REJECTED
+      and M1_AFTER_SAME_DAY_SELL["positions"][0]["qty"] == 100
+      and M1_AFTER_SAME_DAY_SELL["positions"][0]["available_qty"] == 0
+      and M1_AFTER_SAME_DAY_SELL["positions"][0]["pending_settlement_qty"] == 100)
+
+M1_NEXT_DAY = datetime(2026, 8, 18, 10, 0, 0)
+M1_NEXT_DAY_REFS = _m1_refs(
+    M1_ENGINE, strategy="m1-round-3", price="4.50", at=M1_NEXT_DAY,
+)
+M1_AFTER_SETTLEMENT = M1_LEDGER.summary()
+check("下一有效交易日首次 observation 追加 settlement fact 并解锁 sellable",
+      M1_AFTER_SETTLEMENT["positions"][0]["qty"] == 100
+      and M1_AFTER_SETTLEMENT["positions"][0]["sellable_qty"] == 100
+      and M1_AFTER_SETTLEMENT["positions"][0]["pending_settlement_qty"] == 0
+      and M1_AFTER_SETTLEMENT["positions"][0]["available_qty"] == 100
+      and sum(
+          event["event_type"] == "SETTLEMENT_RELEASED"
+          for event in M1_LEDGER.iter_events()
+      ) == 1)
+M1_SETTLED_EVENT_COUNT = len(list(M1_LEDGER.iter_events()))
+M1_RESTARTED_AFTER_SETTLEMENT = paper.ExperimentLedger(M1_ROOT)
+_m1_refs(
+    paper.PaperExecutionEngine(M1_RESTARTED_AFTER_SETTLEMENT),
+    strategy="m1-round-3", price="4.50", at=M1_NEXT_DAY,
+)
+check("restart reconstruction 保持 total / sellable / pending 且不会重复解冻",
+      M1_RESTARTED_AFTER_SETTLEMENT.summary() == M1_AFTER_SETTLEMENT
+      and len(list(M1_RESTARTED_AFTER_SETTLEMENT.iter_events()))
+      == M1_SETTLED_EVENT_COUNT)
+
+M1_OPEN_SELL = M1_ENGINE.submit(
+    _m1_report("m1-open-sell", action="sell", price="4.60").order,
+    strategy_id="m1-round-3", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_NEXT_DAY_REFS, now=M1_NEXT_DAY,
+)
+check("OPEN SELL reservation 只占用已解冻 sellable qty",
+      M1_OPEN_SELL.state is paper.SyntheticOrderState.OPEN
+      and M1_LEDGER.summary()["positions"][0]["sellable_qty"] == 100
+      and M1_LEDGER.summary()["positions"][0]["available_qty"] == 0)
+M1_CANCEL_OPEN_SELL = M1_ENGINE.submit(
+    _m1_report(
+        "m1-cancel-open-sell", action="cancel", qty=None, price=None,
+        wtbh=M1_OPEN_SELL.order_reference,
+    ).order,
+    strategy_id="m1-round-3", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_NEXT_DAY_REFS, now=M1_NEXT_DAY,
+)
+check("CANCEL OPEN SELL 后 reservation 释放但持仓 settlement 状态不变",
+      M1_CANCEL_OPEN_SELL.state is paper.SyntheticOrderState.CANCELLED
+      and M1_LEDGER.summary()["positions"][0]["sellable_qty"] == 100
+      and M1_LEDGER.summary()["positions"][0]["available_qty"] == 100
+      and M1_LEDGER.summary()["positions"][0]["pending_settlement_qty"] == 0)
+
+M1_SELL = M1_ENGINE.submit(
+    _m1_report("m1-sell", action="sell", price="4.40").order,
+    strategy_id="m1-round-3", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_NEXT_DAY_REFS, now=M1_NEXT_DAY,
+)
+M1_AFTER_SELL = M1_LEDGER.summary()
+check("T+1 position 解冻后 SELL 才成交且 realized P&L 正确",
+      M1_SELL.state is paper.SyntheticOrderState.FILLED
+      and M1_AFTER_SELL["positions"] == []
+      and M1_AFTER_SELL["realized_pnl"] == "40.00")
+check("SELL fee、累计费用与 turnover 正确",
+      M1_SELL.fee == Decimal("5.00")
+      and M1_AFTER_SELL["cumulative_fees"] == "10.00"
+      and M1_AFTER_SELL["turnover"] == "850.00")
+M1_SELL_EVENT_COUNT = len(list(M1_LEDGER.iter_events()))
+M1_DUPLICATE_SELL = paper.PaperExecutionEngine(
+    paper.ExperimentLedger(M1_ROOT)
+).submit(
+    _m1_report("m1-sell", action="sell", price="4.40").order,
+    strategy_id="m1-round-3", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_NEXT_DAY_REFS, now=M1_NEXT_DAY,
+)
+check("restart 后 duplicate SELL 不会双减 position 或重复计入 P&L",
+      M1_DUPLICATE_SELL.state is paper.SyntheticOrderState.FILLED
+      and M1_LEDGER.summary() == M1_AFTER_SELL
+      and len(list(M1_LEDGER.iter_events())) == M1_SELL_EVENT_COUNT)
+
+M1_T0_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-t0-"))
+M1_T0_LEDGER = paper.ExperimentLedger(M1_T0_ROOT)
+M1_T0_ENGINE = paper.PaperExecutionEngine(M1_T0_LEDGER)
+M1_T0_BUY_REFS = _m1_refs(
+    M1_T0_ENGINE, strategy="m1-t0-buy", price="4.00",
+    catalog_value=M1_T0_CATALOG,
+)
+M1_T0_BUY = M1_T0_ENGINE.submit(
+    _m1_report("m1-t0-buy").order,
+    strategy_id="m1-t0-buy", object_id="SH_510300",
+    catalog=M1_T0_CATALOG, references=M1_T0_BUY_REFS, now=NOW,
+)
+M1_T0_SELL_AT = datetime(2026, 8, 17, 11, 0, 0)
+M1_T0_SELL_REFS = _m1_refs(
+    M1_T0_ENGINE, strategy="m1-t0-sell", price="4.50", at=M1_T0_SELL_AT,
+    catalog_value=M1_T0_CATALOG,
+)
+M1_T0_BEFORE_SELL = M1_T0_LEDGER.summary()
+M1_T0_SELL = M1_T0_ENGINE.submit(
+    _m1_report("m1-t0-sell", action="sell", price="4.40").order,
+    strategy_id="m1-t0-sell", object_id="SH_510300",
+    catalog=M1_T0_CATALOG, references=M1_T0_SELL_REFS, now=M1_T0_SELL_AT,
+)
+check("catalog 显式 T+0 ETF 允许同日 BUY 后 SELL",
+      M1_T0_BUY.state is paper.SyntheticOrderState.FILLED
+      and M1_T0_BEFORE_SELL["positions"][0]["sellable_qty"] == 100
+      and M1_T0_BEFORE_SELL["positions"][0]["pending_settlement_qty"] == 0
+      and M1_T0_SELL.state is paper.SyntheticOrderState.FILLED
+      and M1_T0_LEDGER.summary()["positions"] == [])
+
+M1_MARK_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-mark-"))
+M1_MARK_LEDGER = paper.ExperimentLedger(M1_MARK_ROOT)
+M1_MARK_ENGINE = paper.PaperExecutionEngine(M1_MARK_LEDGER)
+M1_MARK_REFS = _m1_refs(M1_MARK_ENGINE, strategy="m1-mark-1", price="4.00")
+M1_MARK_ENGINE.submit(
+    _m1_report("m1-mark-buy").order,
+    strategy_id="m1-mark-1", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_MARK_REFS, now=NOW,
+)
+_m1_refs(
+    M1_MARK_ENGINE, strategy="m1-mark-2", price="3.00",
+    at=datetime(2026, 8, 17, 14, 0, 0),
+)
+M1_MARKED = M1_MARK_LEDGER.summary()
+check("mark-to-market 更新 market value / unrealized P&L / NAV",
+      M1_MARKED["market_value"] == "300.00"
+      and M1_MARKED["unrealized_pnl"] == "-105.00"
+      and M1_MARKED["nav"] == "895.00")
+check("high-water mark 与 drawdown 按当轮 quote 更新",
+      M1_MARKED["high_water_mark"] == "1000.00"
+      and M1_MARKED["drawdown_pct"] == "10.5000"
+      and M1_MARKED["max_drawdown_pct"] == "10.5000")
+
+M1_CASH_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-cash-"))
+M1_CASH_LEDGER = paper.ExperimentLedger(M1_CASH_ROOT)
+M1_CASH_ENGINE = paper.PaperExecutionEngine(M1_CASH_LEDGER)
+M1_CASH_REFS = _m1_refs(M1_CASH_ENGINE, strategy="m1-cash", price="4.00")
+M1_NO_CASH = M1_CASH_ENGINE.submit(
+    _m1_report("m1-no-cash", qty=300).order,
+    strategy_id="m1-cash", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_CASH_REFS, now=NOW,
+)
+check("insufficient synthetic cash 不成交且不改变账户",
+      M1_NO_CASH.state is paper.SyntheticOrderState.REJECTED
+      and M1_CASH_LEDGER.summary()["current_cash"] == "1000.00"
+      and M1_CASH_LEDGER.summary()["positions"] == [])
+
+M1_OVERSELL = M1_CASH_ENGINE.submit(
+    _m1_report("m1-oversell", action="sell", qty=100, price="3.90").order,
+    strategy_id="m1-cash", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_CASH_REFS, now=NOW,
+)
+check("oversell 不成交且不形成 short position",
+      M1_OVERSELL.state is paper.SyntheticOrderState.REJECTED
+      and M1_CASH_LEDGER.summary()["positions"] == [])
+
+M1_OPEN_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-open-"))
+M1_OPEN_LEDGER = paper.ExperimentLedger(M1_OPEN_ROOT)
+M1_OPEN_ENGINE = paper.PaperExecutionEngine(M1_OPEN_LEDGER)
+M1_OPEN_REFS = _m1_refs(M1_OPEN_ENGINE, strategy="m1-open-1", price="4.00")
+M1_OPEN = M1_OPEN_ENGINE.submit(
+    _m1_report("m1-open", price="3.90").order,
+    strategy_id="m1-open-1", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_OPEN_REFS, now=NOW,
+)
+check("limit 未触及时保持 OPEN 并预留可用现金",
+      M1_OPEN.state is paper.SyntheticOrderState.OPEN
+      and len(M1_OPEN_LEDGER.summary()["open_synthetic_orders"]) == 1
+      and M1_OPEN_LEDGER.summary()["available_cash"] == "605.00")
+
+M1_TRIGGER_AT = datetime(2026, 8, 17, 11, 30, 0)
+_m1_refs(M1_OPEN_ENGINE, strategy="m1-open-2", price="3.80", at=M1_TRIGGER_AT)
+M1_TRIGGERED = M1_OPEN_LEDGER.summary()
+M1_TRIGGER_EVENT_COUNT = len(list(M1_OPEN_LEDGER.iter_events()))
+_m1_refs(M1_OPEN_ENGINE, strategy="m1-open-2", price="3.80", at=M1_TRIGGER_AT)
+check("limit 触及时只成交一次",
+      M1_TRIGGERED["positions"][0]["qty"] == 100
+      and M1_TRIGGERED["current_cash"] == "615.00"
+      and M1_OPEN_LEDGER.summary() == M1_TRIGGERED
+      and len(list(M1_OPEN_LEDGER.iter_events())) == M1_TRIGGER_EVENT_COUNT)
+
+M1_CANCEL_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-cancel-"))
+M1_CANCEL_LEDGER = paper.ExperimentLedger(M1_CANCEL_ROOT)
+M1_CANCEL_ENGINE = paper.PaperExecutionEngine(M1_CANCEL_LEDGER)
+M1_CANCEL_REFS = _m1_refs(M1_CANCEL_ENGINE, strategy="m1-cancel-1", price="4.00")
+M1_CANCEL_OPEN = M1_CANCEL_ENGINE.submit(
+    _m1_report("m1-cancel-open", price="3.90").order,
+    strategy_id="m1-cancel-1", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_CANCEL_REFS, now=NOW,
+)
+M1_CANCEL = M1_CANCEL_ENGINE.submit(
+    _m1_report(
+        "m1-cancel", action="cancel", qty=None, price=None,
+        wtbh=M1_CANCEL_OPEN.order_reference,
+    ).order,
+    strategy_id="m1-cancel-1", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_CANCEL_REFS, now=NOW,
+)
+_m1_refs(
+    M1_CANCEL_ENGINE, strategy="m1-cancel-2", price="3.80",
+    at=datetime(2026, 8, 17, 12, 0, 0),
+)
+check("CANCEL 后 open order 不得继续成交",
+      M1_CANCEL.state is paper.SyntheticOrderState.CANCELLED
+      and M1_CANCEL_LEDGER.summary()["open_synthetic_orders"] == []
+      and M1_CANCEL_LEDGER.summary()["positions"] == [])
+
+M1_EXPIRY_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-expiry-"))
+M1_EXPIRY_LEDGER = paper.ExperimentLedger(M1_EXPIRY_ROOT)
+M1_EXPIRY_ENGINE = paper.PaperExecutionEngine(M1_EXPIRY_LEDGER)
+M1_EXPIRY_REFS = _m1_refs(M1_EXPIRY_ENGINE, strategy="m1-expiry", price="4.00")
+M1_EXPIRY_ENGINE.submit(
+    _m1_report("m1-expiry-open", price="3.90").order,
+    strategy_id="m1-expiry", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_EXPIRY_REFS, now=NOW,
+)
+M1_EXPIRED_COUNT = M1_EXPIRY_ENGINE.expire_due(
+    now=datetime(2026, 8, 17, 15, 0, 0)
+)
+check("DAY order 到日终转为 EXPIRED",
+      M1_EXPIRED_COUNT == 1
+      and M1_EXPIRY_LEDGER.summary()["open_synthetic_orders"] == []
+      and list(M1_EXPIRY_LEDGER.iter_events())[-1]["order_state"] == "EXPIRED")
+
+M1_CONTEXT = M1_MARK_LEDGER.model_account_context(
+    now=datetime(2026, 8, 17, 14, 0, 0)
+)
+M1_POSITION_CONTEXT = M1_MARK_LEDGER.model_position_context("510300")
+check("synthetic cash / position / activity 可投影进现有 model account context",
+      M1_CONTEXT["账户"]["可用资金"] == "595.00"
+      and M1_POSITION_CONTEXT["数量"] == 100
+      and M1_POSITION_CONTEXT["可用数量"] == 0
+      and M1_POSITION_CONTEXT["冻结数量"] == 100
+      and M1_CONTEXT["账户"]["持仓列表"][0]["持仓数量"] == 100
+      and M1_CONTEXT["账户"]["持仓列表"][0]["可用数量"] == 0
+      and M1_CONTEXT["账户"]["持仓列表"][0]["冻结数量"] == 100
+      and M1_POSITION_CONTEXT["成本价"] == "4.05"
+      and M1_CONTEXT["当日流水"]["条数"] >= 1)
+
+M1_POLICY_SNAPSHOT = M1_MARK_LEDGER.experiment_snapshot()
+M1_POLICY_DECISION = POLICY.evaluate(
+    _m1_report("m1-policy", qty=100, price="4.00").order,
+    M1_POLICY_SNAPSHOT,
+)
+check("ExperimentPolicy 读取 synthetic snapshot 而非 real broker account",
+      M1_POLICY_SNAPSHOT.net_equity_cny == Decimal("895.00")
+      and M1_POLICY_SNAPSHOT.available_cash_cny == Decimal("595.00")
+      and M1_POLICY_SNAPSHOT.symbol_position_qty == {"510300": 100}
+      and M1_POLICY_DECISION.result is experiment.PolicyResult.REJECT)
+
+M1_REQUIRED_FACT_FIELDS = {
+    "strategy_id", "instruction_code", "object_id", "action", "qty",
+    "model_limit_price", "simulated_execution_price", "order_state", "fill_qty",
+    "fee", "cash_delta", "position_delta", "realized_pnl_delta",
+    "resulting_cash", "resulting_position", "resulting_nav", "timestamp",
+}
+check("每个 durable ledger event 含 M1 要求的关联字段",
+      all(M1_REQUIRED_FACT_FIELDS <= set(event) for event in M1_LEDGER.iter_events()))
+
+M1_BENCH_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-benchmark-"))
+M1_BENCH_LEDGER = paper.ExperimentLedger(
+    M1_BENCH_ROOT,
+    benchmark=paper.SimulationBenchmarkConfig(buy_and_hold_symbol="510300"),
+)
+M1_BENCH_ENGINE = paper.PaperExecutionEngine(M1_BENCH_LEDGER)
+_m1_refs(M1_BENCH_ENGINE, strategy="m1-bench-1", price="4.00")
+_m1_refs(
+    M1_BENCH_ENGINE, strategy="m1-bench-2", price="5.00",
+    at=datetime(2026, 8, 17, 14, 30, 0),
+)
+check("CASH benchmark 恒为 1000 且 configurable buy-and-hold 只记录比较事实",
+      M1_BENCH_LEDGER.summary()["benchmarks"]["cash_nav"] == "1000.00"
+      and M1_BENCH_LEDGER.summary()["benchmarks"]["nav"] == "1250.00")
+
+M1_FAKE_BROKER = _Broker()
+check("M1 paper venue 不实现/不调用 BrokerAdapter，FakeBroker calls = 0",
+      M1_FAKE_BROKER.calls == 0
+      and not hasattr(M1_ENGINE, "place_order")
+      and runmode.VERIFICATION_LOCK is True)
+
+_STRATEGY_BASELINE_HASHES = {
+    "prompts.py": "355ad4d590951363e3c87e3f928a97f432a8575beba420454a6a607d2495d958",
+    "indicators.py": "9cdbeedcea32c72587c5e3f1072f9b0637d489ec1151dce7b15febb554fd8319",
+    "scheduler.py": "b4d904b2c2d2adff7a69067f422525959744695e1d18838f17756322cd504a0d",
+}
+_MODULE_ROOT = Path(__file__).resolve().parent.parent / "zhixing"
+check("M1 未修改 prompt / indicators / six-round scheduler baseline",
+      all(
+          hashlib.sha256((_MODULE_ROOT / name).read_bytes()).hexdigest() == digest
+          for name, digest in _STRATEGY_BASELINE_HASHES.items()
+      ))
 
 
 print("\n=== 保证四:标的属性只有一个来源(清单),不写死在代码里 ===")
@@ -1050,7 +1472,8 @@ def call(method: str, path: str, *, query=None, body=None) -> api.Response:
 ROUTES = [
     ("GET", "/api/status"), ("GET", "/api/objects"), ("POST", "/api/objects"),
     ("PUT", "/api/objects/SH_510300"), ("DELETE", "/api/objects/SH_510300"),
-    ("GET", "/api/account"), ("GET", "/api/runs"), ("GET", "/api/runs/20260817-093000"),
+    ("GET", "/api/account"), ("GET", "/api/experiment"),
+    ("GET", "/api/runs"), ("GET", "/api/runs/20260817-093000"),
     ("GET", "/api/runs/compare"), ("GET", "/api/usage"),
     ("GET", "/api/instructions/pending"), ("POST", "/api/instructions/i-001/confirm"),
     ("GET", "/api/settings/schedule"), ("PUT", "/api/settings/schedule"),
@@ -1075,6 +1498,34 @@ check("路径存在但方法不对报 405,不报 404(否则人会去查一个其
       call("POST", "/api/status").status == 405)
 check("/api/runs/compare 先于 /api/runs/{id} 匹配(否则去找一份叫 compare 的归档)",
       "对比项" in call("GET", "/api/runs/compare").payload["data"])
+
+M1_API_INITIAL = call("GET", "/api/experiment")
+check("GET /api/experiment 返回只读 synthetic account 初始摘要",
+      M1_API_INITIAL.status == 200
+      and M1_API_INITIAL.payload["data"]["initial_cash"] == "1000.00"
+      and M1_API_INITIAL.payload["data"]["nav"] == "1000.00"
+      and M1_API_INITIAL.payload["data"]["open_synthetic_orders"] == [])
+
+M1_NOISE_RUNTIME = Path(tempfile.mkdtemp(prefix="zhixing-m1-real-account-noise-"))
+M1_NOISE_STORE = state.Store(M1_NOISE_RUNTIME)
+M1_NOISE_APP = api.App(
+    store=M1_NOISE_STORE,
+    archive_root=M1_MARK_ROOT,
+    experiment_ledger=M1_MARK_LEDGER,
+)
+M1_BEFORE_REAL_NOISE = api.get_experiment(
+    M1_NOISE_APP, api.Request("GET", "/api/experiment", {}, None)
+).payload["data"]
+M1_NOISE_STORE.save_account({
+    "总资产": "999999.99", "可用资金": "888888.88", "证券市值": "111111.11",
+    "持仓列表": [{"证券代码": "510300", "持仓数量": 999999, "市值": "777777.77"}],
+}, collected_at="2026-08-17T10:00:00")
+M1_AFTER_REAL_NOISE = api.get_experiment(
+    M1_NOISE_APP, api.Request("GET", "/api/experiment", {}, None)
+).payload["data"]
+check("real broker account snapshot 不影响 M1 ExperimentLedger / API",
+      M1_AFTER_REAL_NOISE == M1_BEFORE_REAL_NOISE
+      and M1_AFTER_REAL_NOISE["nav"] == "895.00")
 
 # -- 状态 -----------------------------------------------------------------
 
@@ -1186,17 +1637,23 @@ NEW = call("POST", "/api/objects", body={
     "类型": "交易标的", "资产类型": "ETF",
 })
 check("新增标的,object_id 由后端按市场_代码生成",
-      NEW.payload["data"]["object_id"] == "SH_510300")
+      NEW.payload["data"]["object_id"] == "SH_510300"
+      and NEW.payload["data"]["turnover_mode"] == "T+1")
 check("采集层没接时持仓是 null,不是 0(「空仓」和「没采到」必须分得开)",
       NEW.payload["data"]["持仓"] is None)
-check("提交多余字段不被采纳(可写字段只有五个)",
+check("提交多余采集字段不被采纳(catalog 可写字段不含持仓)",
       call("POST", "/api/objects", body={
           "market": "SZ", "symbol": "159941", "名称": "演示海外乙ETF",
-          "类型": "行情对象", "资产类型": "ETF", "持仓": {"持仓数量": 99999},
+          "类型": "行情对象", "资产类型": "ETF", "turnover_mode": "T+0",
+          "持仓": {"持仓数量": 99999},
       }).payload["data"]["持仓"] is None)
 check("清单里两个都在,类型区分得开",
       {o["object_id"]: o["类型"] for o in call("GET", "/api/objects").payload["data"]}
       == {"SH_510300": "交易标的", "SZ_159941": "行情对象"})
+check("catalog turnover_mode 缺省 T+1、显式 T+0 且存盘重读不丢",
+      {o["object_id"]: o["turnover_mode"]
+       for o in call("GET", "/api/objects").payload["data"]}
+      == {"SH_510300": "T+1", "SZ_159941": "T+0"})
 
 check("改名字改得动",
       call("PUT", "/api/objects/SH_510300", body={
@@ -1822,6 +2279,125 @@ ONE_STORE.save_catalog([
     catalog.TradeObject("SH_510300", "SH", "510300", "演示宽基甲ETF", asset_type="ETF")
 ])
 
+# 端到端证明 M1 Runner 把模型 BUY 交给 paper venue，而且 ledger
+# 已成交、round archive 还没落盘的 crash window 不会造成二次记账。
+M1_E2E_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-e2e-crash-"))
+M1_E2E_LEDGER = paper.ExperimentLedger(M1_E2E_ROOT)
+M1_E2E_PROVIDER_CALLS = {"count": 0}
+
+
+def _m1_e2e_forbidden_broker_provider():
+    M1_E2E_PROVIDER_CALLS["count"] += 1
+    return _Broker()
+
+
+M1_E2E_RUNNER = runner.Runner(
+    store=ONE_STORE,
+    archive_root=M1_E2E_ROOT,
+    caller=_ScriptedCaller(),
+    target=OPENAI,
+    source=_OneSource(),
+    broker_provider=_m1_e2e_forbidden_broker_provider,
+    authorization_kind=AuthorizationKind.SIMULATION,
+    paper_engine=paper.PaperExecutionEngine(M1_E2E_LEDGER),
+    clock=lambda: datetime(2026, 8, 17, 10, 12, 0),
+)
+M1_E2E_STRATEGY = "m1-e2e-crash-round"
+_m1_real_write_run = archive.write_run
+_m1_crash_once = {"yes": True}
+
+
+def _m1_crash_before_round_archive(payload, *, root):
+    if _m1_crash_once["yes"]:
+        _m1_crash_once["yes"] = False
+        raise OSError("M1 模拟 ledger fill 后、round archive 前 crash")
+    return _m1_real_write_run(payload, root=root)
+
+
+archive.write_run = _m1_crash_before_round_archive
+try:
+    M1_E2E_RUNNER.run_round(strategy_id=M1_E2E_STRATEGY)
+except OSError:
+    pass
+finally:
+    archive.write_run = _m1_real_write_run
+M1_E2E_AFTER_CRASH = M1_E2E_LEDGER.summary()
+M1_E2E_EVENT_COUNT = len(list(M1_E2E_LEDGER.iter_events()))
+M1_E2E_RECOVERED = M1_E2E_RUNNER.run_round(strategy_id=M1_E2E_STRATEGY)
+M1_E2E_AFTER_RECOVERY = M1_E2E_LEDGER.summary()
+M1_E2E_ARCHIVED = json.loads(M1_E2E_RECOVERED.path.read_text(encoding="utf-8"))
+check("M1 Runner 端到端将合法 LLM BUY 成交到 isolated ledger",
+      M1_E2E_AFTER_CRASH["current_cash"] == "603.80"
+      and M1_E2E_AFTER_CRASH["positions"][0]["qty"] == 100
+      and M1_E2E_ARCHIVED["待执行指令"][0]["模拟执行结果"]["order_state"] == "FILLED"
+      and M1_E2E_PROVIDER_CALLS["count"] == 0)
+check("M1 ledger fill 后、round archive 前 crash，恢复不双扣现金或双增持仓",
+      M1_E2E_AFTER_RECOVERY == M1_E2E_AFTER_CRASH
+      and len(list(M1_E2E_LEDGER.iter_events())) == M1_E2E_EVENT_COUNT
+      and M1_E2E_RECOVERED.path.exists())
+
+# M1 Runner 必须把 ledger 的现金/持仓投影到真实模型请求，而不是只在 API 里展示。
+M1_CONTEXT_ROOT = Path(tempfile.mkdtemp(prefix="zhixing-m1-context-runner-"))
+M1_CONTEXT_LEDGER = paper.ExperimentLedger(M1_CONTEXT_ROOT)
+M1_CONTEXT_ENGINE = paper.PaperExecutionEngine(M1_CONTEXT_LEDGER)
+M1_CONTEXT_REFS = _m1_refs(
+    M1_CONTEXT_ENGINE, strategy="m1-context-seed", price="3.912",
+    at=datetime(2026, 8, 17, 10, 15, 0),
+)
+M1_CONTEXT_ENGINE.submit(
+    _m1_report("m1-context-buy", price="3.912").order,
+    strategy_id="m1-context-seed", object_id="SH_510300",
+    catalog=M1_CATALOG, references=M1_CONTEXT_REFS,
+    now=datetime(2026, 8, 17, 10, 15, 0),
+)
+
+
+class _SyntheticContextCaller:
+    def __init__(self):
+        self.contexts: list[dict] = []
+
+    def call(self, target, body, *, object_id):
+        self.contexts.append(json.loads(body["messages"][-1]["content"]))
+        return model.parse_reply(target, _reply(json.dumps({
+            "object_id": object_id,
+            "操作": "hold",
+            "理由": ["保持 M1 context projection 测试"],
+            "风险": ["仅 synthetic facts"],
+            "置信度": 0.5,
+            "改判条件": "synthetic account 或行情变化",
+        }, ensure_ascii=False)), object_id=object_id)
+
+
+M1_CONTEXT_CALLER = _SyntheticContextCaller()
+M1_CONTEXT_PROVIDER_CALLS = {"count": 0}
+
+
+def _m1_forbidden_broker_provider():
+    M1_CONTEXT_PROVIDER_CALLS["count"] += 1
+    return _Broker()
+
+
+M1_CONTEXT_RESULT = runner.Runner(
+    store=ONE_STORE,
+    archive_root=M1_CONTEXT_ROOT,
+    caller=M1_CONTEXT_CALLER,
+    target=OPENAI,
+    source=_OneSource(),
+    broker_provider=_m1_forbidden_broker_provider,
+    authorization_kind=AuthorizationKind.SIMULATION,
+    paper_engine=M1_CONTEXT_ENGINE,
+    clock=lambda: datetime(2026, 8, 17, 10, 20, 0),
+).run_round(strategy_id="m1-context-round")
+M1_MODEL_CONTEXT = M1_CONTEXT_CALLER.contexts[0]
+check("Runner 把 synthetic account 完整投影进模型下一轮 context",
+      M1_MODEL_CONTEXT["账户交易流水表"]["来源"].startswith("ExperimentLedger")
+      and M1_MODEL_CONTEXT["账户交易流水表"]["账户"]["可用资金"] == "603.80"
+      and M1_MODEL_CONTEXT["交易对象数据"]["持仓"]["数量"] == 100
+      and M1_MODEL_CONTEXT["交易对象数据"]["持仓"]["成本价"] == "3.962")
+check("M1 Runner 即使注入 broker_provider 也绝不解析或调用它",
+      M1_CONTEXT_PROVIDER_CALLS["count"] == 0
+      and M1_CONTEXT_RESULT.path is not None)
+
 # 券商不可用是已知缺项:执行结果如实为 failed,但模型轮次本身仍算成功。
 runmode.set_unattended(True, changed_by="smoke", reason="自检:券商为空")
 _runner_live_lock = runmode.VERIFICATION_LOCK
@@ -1922,7 +2498,10 @@ check("非交易日不跑",
 
 shutil.rmtree(RUN_ROOT, ignore_errors=True)
 shutil.rmtree(RUN_STATE, ignore_errors=True)
-for _path in (SIM_ROOT, ONE_STATE, NONE_ROOT, UNKNOWN_ROOT, CRASH_ROUND_ROOT):
+for _path in (
+    SIM_ROOT, ONE_STATE, M1_E2E_ROOT, M1_CONTEXT_ROOT,
+    NONE_ROOT, UNKNOWN_ROOT, CRASH_ROUND_ROOT,
+):
     shutil.rmtree(_path, ignore_errors=True)
 
 
@@ -2138,6 +2717,32 @@ from zhixing import collect as collect_mod
 from zhixing import daemon as daemon_mod
 from zhixing import indicators as ind_mod
 from zhixing import quotes as quotes_mod
+
+_M1_DAEMON_STORE = state.Store(
+    Path(tempfile.mkdtemp(prefix="zhixing-m1-daemon-runtime-"))
+)
+_M1_DAEMON_STORE.save_model(state.ModelSettings(
+    endpoint="https://model.invalid/v1",
+    name="m1-test-model",
+    provider="m1-test-provider",
+    secret="DEMOFAKEKEYM1MODEL0001",
+))
+_M1_DAEMON = daemon_mod.Daemon(
+    _M1_DAEMON_STORE,
+    archive_root=Path(tempfile.mkdtemp(prefix="zhixing-m1-daemon-archive-")),
+)
+_M1_DEFAULT_RUNNER = daemon_mod.build_runner(
+    _M1_DAEMON_STORE,
+    archive_root=_M1_DAEMON.archive_root,
+    source=_M1_DAEMON.collector,
+)
+check("M1 daemon 默认路径只有 MarketCollector + PaperExecutionEngine",
+      isinstance(_M1_DAEMON.collector, collect_mod.MarketCollector)
+      and not hasattr(_M1_DAEMON.collector, "execution_broker")
+      and not hasattr(_M1_DAEMON.collector, "session")
+      and _M1_DEFAULT_RUNNER.broker_provider is None
+      and _M1_DEFAULT_RUNNER.authorization_kind is AuthorizationKind.SIMULATION
+      and isinstance(_M1_DEFAULT_RUNNER.paper_engine, paper.PaperExecutionEngine))
 
 # -- 指标:缺了就是 None,不是 0 -------------------------------------------
 
@@ -2741,7 +3346,7 @@ check("**quote_only 不含宏观对象**——两者采集路径不同,"
       and len(_M_CAT.background) == 2 and len(_M_CAT.tradable) == 1)
 
 # 清单存回去再读出来,类型不能丢。save_catalog 是**整份重写**,
-# 它只写七个字段——宏观对象要能从这七个字段里原样还原。
+# 它只写 catalog 字段——宏观对象要能从这些字段里原样还原。
 _M_STORE = state.Store(Path(tempfile.mkdtemp(prefix="zhixing-macro-")))
 _M_STORE.save_catalog(list(_M_CAT.objects))
 _M_BACK = _M_STORE.catalog()

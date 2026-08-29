@@ -1,4 +1,4 @@
-"""标的清单 —— 名称、资产类型、交易单位的唯一来源。
+"""标的清单 —— 名称、资产类型、交易单位、回转制度的唯一来源。
 
 ## 这个模块要解决的问题
 
@@ -26,7 +26,8 @@
 三代验证期只读挂载二代 runtime,所以要能读二代那份 JSON。两代的字段名不同:
 
     二代:{"object_id", "市场", "代码", "名称", "资产类型", "交易单位"}
-    三代:{"object_id", "market", "symbol", "名称", "类型", "资产类型", "交易单位"}
+    三代:{"object_id", "market", "symbol", "名称", "类型", "资产类型", "交易单位",
+          "turnover_mode"}
 
 `from_entry()` 两种都认。
 
@@ -84,6 +85,9 @@ MACRO_MARKET = "MACRO"
 VALID_MARKETS = frozenset({"SH", "SZ"})
 VALID_KINDS = frozenset({KIND_TRADABLE, KIND_QUOTE_ONLY, KIND_MACRO})
 VALID_ASSET_TYPES = frozenset({"ETF", "股票"})
+TURNOVER_T0 = "T+0"
+TURNOVER_T1 = "T+1"
+VALID_TURNOVER_MODES = frozenset({TURNOVER_T0, TURNOVER_T1})
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +111,17 @@ class TradeObject:
     kind: str = KIND_TRADABLE       # 交易标的 / 行情对象 / 宏观对象
     asset_type: str = "股票"         # ETF / 股票 / 宏观对象的类别(外汇、大宗商品…)
     lot_size: int = 100
+    # 缺失时保守按 T+1。ETF 不能仅凭 asset_type 推断为 T+0。
+    turnover_mode: str = TURNOVER_T1
+
+    def __post_init__(self) -> None:
+        if self.turnover_mode not in VALID_TURNOVER_MODES:
+            raise ValueError(
+                f"turnover_mode 只能是 {TURNOVER_T0} 或 {TURNOVER_T1},"
+                f"收到 {self.turnover_mode!r}"
+            )
+        if self.turnover_mode == TURNOVER_T0 and self.asset_type != "ETF":
+            raise ValueError("M1 只允许 ETF 显式声明 turnover_mode=T+0")
 
     @property
     def is_etf(self) -> bool:
@@ -344,6 +359,14 @@ def from_entry(
     except (TypeError, ValueError):
         lot_size = 100
 
+    raw_turnover = entry.get("turnover_mode", entry.get("回转制度", TURNOVER_T1))
+    turnover_mode = str(raw_turnover or TURNOVER_T1).strip().upper()
+    if turnover_mode not in VALID_TURNOVER_MODES:
+        raise ValueError(
+            f"turnover_mode 只能是 {TURNOVER_T0} 或 {TURNOVER_T1},"
+            f"收到 {turnover_mode!r}"
+        )
+
     return TradeObject(
         object_id=object_id,
         market=market,
@@ -352,6 +375,7 @@ def from_entry(
         kind=resolved_kind,
         asset_type=asset_type,
         lot_size=lot_size,
+        turnover_mode=turnover_mode,
     )
 
 
@@ -462,7 +486,7 @@ def validate_draft(
 ) -> tuple[TradeObject | None, tuple[DraftFailure, ...]]:
     """校验前端提交的新增/修改。
 
-    可写字段只有五个(契约 1.2.1),其余都是采集来的,前端提交了也不采纳。
+    可写字段只有六个(契约 1.2.1),其余都是采集来的,前端提交了也不采纳。
     与 `guards.validate()` 同一个取向:**一次跑完,收集全部失败原因**,
     不是遇到第一条就返回——让人一次看全比试错三轮有用。
 
@@ -481,6 +505,8 @@ def validate_draft(
     symbol = str(draft.get("symbol") or "").strip()
     name = str(draft.get("名称") or "").strip()
     asset_type = str(draft.get("资产类型") or "").strip()
+    raw_turnover = draft.get("turnover_mode", draft.get("回转制度", TURNOVER_T1))
+    turnover_mode = str(raw_turnover or TURNOVER_T1).strip().upper()
 
     if market not in VALID_MARKETS:
         failures.append(DraftFailure("BAD_MARKET", f"市场只能是 SH 或 SZ,收到 {market!r}"))
@@ -497,6 +523,16 @@ def validate_draft(
         failures.append(
             DraftFailure("BAD_ASSET_TYPE", f"资产类型只能是 ETF 或 股票,收到 {asset_type!r}")
         )
+    if turnover_mode not in VALID_TURNOVER_MODES:
+        failures.append(DraftFailure(
+            "BAD_TURNOVER_MODE",
+            f"turnover_mode 只能是 {TURNOVER_T0} 或 {TURNOVER_T1},收到 {turnover_mode!r}",
+        ))
+    elif turnover_mode == TURNOVER_T0 and asset_type != "ETF":
+        failures.append(DraftFailure(
+            "T0_REQUIRES_ETF",
+            "M1 只允许 ETF 显式声明 turnover_mode=T+0。",
+        ))
 
     if failures:
         return None, tuple(failures)
@@ -516,6 +552,7 @@ def validate_draft(
             asset_type=asset_type,
             # 一手股数不由前端填:它跟着资产类型走,作为标的元数据统一维护
             lot_size=100,
+            turnover_mode=turnover_mode,
         ),
         (),
     )

@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import SYSTEM_NAME, __version__, archive, catalog as catalog_mod
-from . import execution, experiment, guards, runmode, scheduler, state
+from . import execution, experiment, guards, runmode, scheduler, simulation, state
 from . import captcha, model
 
 logger = logging.getLogger("zhixing.api")
@@ -129,6 +129,9 @@ class App:
     experiment_policy: experiment.ExperimentPolicy = field(
         default_factory=experiment.ExperimentPolicy
     )
+    #: M1 isolated synthetic fact authority。None 只用于旧测试/兼容调用；
+    #: ``GET /api/experiment`` 会按 archive_root 构造同一 ledger 读视图。
+    experiment_ledger: simulation.ExperimentLedger | None = None
     #: 可选的独立实验分配快照来源。M0 默认从非机密账户摘要构造；不依赖
     #: Eastmoney 或任何其他具体券商类型。
     experiment_snapshot_provider: Callable[
@@ -302,6 +305,7 @@ def _object_view(obj: catalog_mod.TradeObject) -> dict[str, Any]:
         "类型": obj.kind,
         "资产类型": obj.asset_type,
         "交易单位": obj.lot_size,
+        "turnover_mode": obj.turnover_mode,
         **_UNCOLLECTED,
     }
 
@@ -346,7 +350,12 @@ def put_object(app: App, req: Request, object_id: str) -> Response:
                 f"历史归档里的引用会失配。请删除后重新添加。",
             )
 
-    draft = {"market": current.market, "symbol": current.symbol, **body}
+    draft = {
+        "market": current.market,
+        "symbol": current.symbol,
+        "turnover_mode": current.turnover_mode,
+        **body,
+    }
     obj, failures = catalog_mod.validate_draft(draft)   # 不传 existing:自己撞自己不算重复
     if obj is None:
         problems = tuple((f.code, f.message) for f in failures)
@@ -400,6 +409,16 @@ def get_account(app: App, req: Request) -> Response:
         "采集时间": snapshot.get("采集时间"),
         **dict(snapshot["账户"]),
     })
+
+
+def get_experiment(app: App, req: Request) -> Response:
+    """M1 isolated synthetic account 的只读、可重建摘要。"""
+    ledger = app.experiment_ledger or simulation.ExperimentLedger(app.archive_root)
+    try:
+        return ok(ledger.summary())
+    except simulation.ExperimentLedgerError as exc:
+        logger.error("ExperimentLedger 无法重建:%s", exc)
+        return fail(503, "EXPERIMENT_LEDGER_UNAVAILABLE", "实验账本当前无法安全重建")
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +665,8 @@ def _experiment_snapshot(
 ) -> experiment.ExperimentSnapshot:
     if app.experiment_snapshot_provider is not None:
         return app.experiment_snapshot_provider(report)
+    if app.experiment_ledger is not None:
+        return app.experiment_ledger.experiment_snapshot()
     return experiment.snapshot_from_account_summary(
         app.store.account(), config=app.experiment_policy.config
     )
@@ -1122,6 +1143,7 @@ _STATIC: dict[tuple[str, str], Callable[[App, Request], Response]] = {
     ("GET", "/api/objects"): get_objects,
     ("POST", "/api/objects"): post_object,
     ("GET", "/api/account"): get_account,
+    ("GET", "/api/experiment"): get_experiment,
     ("GET", "/api/runs"): get_runs,
     ("GET", "/api/runs/compare"): get_compare,
     ("GET", "/api/usage"): get_usage,

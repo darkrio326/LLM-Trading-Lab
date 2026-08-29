@@ -62,7 +62,7 @@ from pathlib import Path
 from typing import Any
 
 from . import SYSTEM_NAME, __version__
-from . import captcha, collect, llm, runner, runmode, scheduler, state, tradingdays
+from . import collect, execution, llm, runner, runmode, scheduler, simulation, state, tradingdays
 
 logger = logging.getLogger("zhixing.daemon")
 
@@ -140,14 +140,16 @@ def build_runner(
     重装的代价是几个 dataclass,一天六次,不值一提。
     """
     settings = store.model()
-    broker_provider = getattr(source, "execution_broker", None)
+    ledger = simulation.ExperimentLedger(archive_root)
     return runner.Runner(
         store=store,
         archive_root=archive_root,
         caller=llm.HttpCaller(credential=llm.Credential(settings.secret)),
         target=settings.to_target(),
         source=source,
-        broker_provider=broker_provider if callable(broker_provider) else None,
+        broker_provider=None,
+        authorization_kind=execution.AuthorizationKind.SIMULATION,
+        paper_engine=simulation.PaperExecutionEngine(ledger),
     )
 
 
@@ -185,11 +187,8 @@ class Daemon:
         self.sleep = sleep
         self._stopping = False
         self._complained_at = 0.0
-        # 采集器**跨轮复用**:浏览器会话保持着,省掉每轮一次登录。
-        # 每登一次都是一次被券商锁卡的机会,这不是性能优化。
-        self.collector = collect.Collector(
-            store=store, solver=captcha.solver_from_settings(store.captcha())
-        )
+        # M1 daemon 只采真实行情；类型上没有 broker session 或登录入口。
+        self.collector = collect.MarketCollector(store=store)
 
     # -- 一次滴答 ---------------------------------------------------------
 
@@ -213,8 +212,6 @@ class Daemon:
             self._complain("还不能开跑,缺:" + "、".join(缺))
             return None
 
-        # 识别器按当前配置重装(验证码密钥会轮换),采集器本身留着。
-        self.collector.solver = captcha.solver_from_settings(self.store.captcha())
         run = build_runner(
             self.store, archive_root=self.archive_root, source=self.collector
         )
@@ -260,7 +257,7 @@ class Daemon:
             SYSTEM_NAME, __version__, self.archive_root, self.store.root,
             self.poll_seconds,
         )
-        logger.info("数据源:%s", collect.describe_source(self.store))
+        logger.info("数据源:%s", collect.describe_simulation_source())
         logger.info("运行模式:%s", runmode.describe()["运行模式"])
 
         while not self._stopping:
@@ -269,7 +266,7 @@ class Daemon:
             if not self._stopping:
                 self.sleep(self.poll_seconds)
 
-        logger.info("正在停止,关掉浏览器会话")
+        logger.info("正在停止 market-only collector")
         self.collector.close()
         return 0
 

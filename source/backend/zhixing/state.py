@@ -400,6 +400,7 @@ class Store:
                         "类型": o.kind,
                         "资产类型": o.asset_type,
                         "交易单位": o.lot_size,
+                        "turnover_mode": o.turnover_mode,
                     }
                     for o in items
                 ]
