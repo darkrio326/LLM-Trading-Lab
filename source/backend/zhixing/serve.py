@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import SYSTEM_NAME, __version__, api, captcha, collect, scheduler, state, tradingdays
+from . import SYSTEM_NAME, __version__, api, collect, scheduler, simulation, state, tradingdays
 
 logger = logging.getLogger("zhixing.serve")
 
@@ -198,32 +198,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"启动失败:{exc}", file=sys.stderr)
         return 2
 
-    # ``数据源``(契约 1.4)由本模块传进去,而且是**每次请求现算的**,
-    # 不是一句字面量,也不是启动时定死的一个值。
-    #
-    # 这个字段有前科:它曾经写死着「只读挂载二代 runtime」,而部署后容器里
-    # 根本没有那个挂载——状态页把一句没有任何代码在做的承诺当事实显示着。
-    # ``collect.describe_source`` 从 ``quotes.SOURCES`` 和券商配置现状算,
-    # 改了行情源顺序或动了券商配置,这句话跟着变。
-    #
-    # 传函数而不是传字符串,是因为**券商配置能在界面上改**:启动时算一次
-    # 会让状态页一直说「未配置」,直到有人想起来重启服务——那又是一句
-    # 和现状不符的话,等于把同一个毛病换了个地方犯。
-    # 人工确认、撤单和委托查询按需使用自己的采集器。构造本身不登录;
-    # 只有对应接口被调用时才走现有 login.ensure_session 通路。
-    api_collector = collect.Collector(
-        store=store, solver=captcha.solver_from_settings(store.captcha())
-    )
-
-    def broker_provider():
-        api_collector.solver = captcha.solver_from_settings(store.captcha())
-        return api_collector.connect_broker()
-
+    # ``数据源``(契约 1.4)由可执行的来源描述函数给出，行情源顺序变化时
+    # 状态页会同步变化；账户来源固定为 ExperimentLedger，不读取 broker 配置。
+    # M1 API 是 isolated simulation 观察面：不构造 broker provider，也没有
+    # 页面请求能够触发 Selenium 登录。M0 execution contract 仍保留但锁定。
+    archive_root = Path(args.archive_root)
     app = api.App(
         store=store,
-        archive_root=Path(args.archive_root),
-        data_source=lambda: collect.describe_source(store),
-        broker_provider=broker_provider,
+        archive_root=archive_root,
+        data_source=collect.describe_simulation_source,
+        broker_provider=None,
+        experiment_ledger=simulation.ExperimentLedger(archive_root),
     )
 
     # 交易日历够不够用。**只警告,不拒绝启动。**

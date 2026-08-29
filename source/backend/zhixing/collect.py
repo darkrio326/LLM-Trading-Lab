@@ -343,6 +343,16 @@ def describe_source(store: state_mod.Store) -> str:
     return f"行情:{行情}(按此顺序退化){宏观};账户:{账户}"
 
 
+def describe_simulation_source() -> str:
+    """M1 daemon 的真实取数边界：真实行情 + 完全隔离的 synthetic account。"""
+    行情 = " → ".join(quotes_mod.SOURCES)
+    宏观 = ";宏观:新浪财经" if macro_mod.MACRO_SPECS else ""
+    return (
+        f"行情:{行情}(按此顺序退化){宏观};"
+        "账户:ExperimentLedger isolated synthetic account(不连接真实券商)"
+    )
+
+
 # ---------------------------------------------------------------------------
 #  碰
 # ---------------------------------------------------------------------------
@@ -630,11 +640,87 @@ class Collector:
             self.session = None
 
 
+@dataclass
+class MarketCollector:
+    """M1 isolated simulation 的 market-only 数据源。
+
+    它复用现有行情、指标与宏观采集语义，但类型上没有 broker session、登录器
+    或 ``execution_broker``。synthetic account 会在 runner 中从 ExperimentLedger
+    投影，因而这条路径不读取 ``Store.account()``，也不触发 Selenium 登录。
+    """
+
+    store: state_mod.Store
+    sleep: Callable[[float], None] = time.sleep
+
+    # 两个方法的实现只依赖 ``sleep`` 与行情模块；复用它们可确保 M1 没有复制、
+    # 漂移现有 quotes / indicators semantics。
+    fetch_object = Collector.fetch_object
+    fetch_macro = Collector.fetch_macro
+
+    def collect(self, *, now: datetime, catalog: Catalog) -> runner_mod.RoundInput:
+        today = now.date()
+        items: list[ObjectData] = []
+        for index, obj in enumerate(catalog.objects):
+            if index:
+                self.sleep(QUOTE_PAUSE)
+            items.append(self.fetch_object(obj, today=today, positions={}))
+
+        problems = [
+            {
+                "object_id": data.obj.object_id,
+                "code": "QUOTE_UNAVAILABLE",
+                "message": f"{data.obj.display} 没采到行情({data.problem}),本轮跳过。",
+            }
+            for data in items if not data.ok
+        ]
+        per_object = {
+            data.obj.object_id: object_entry(data, today=today)
+            for data in items if data.ok and data.obj.is_tradable
+        }
+
+        try:
+            facts = self.store.runtime()
+            self.store.save_runtime(replace(
+                facts, 最近采集时间=now.isoformat(timespec="seconds")
+            ))
+        except (OSError, state_mod.StateError) as exc:
+            logger.warning("market-only 采集时间没能落盘:%s", exc)
+
+        logger.info(
+            "M1 market-only 采集完成:%d 个标的,%d 个可判断,%d 个问题",
+            len(items), len(per_object), len(problems),
+        )
+        return runner_mod.RoundInput(
+            读取范围=scope_entry(items, now),
+            市场数据列表=market_entry(
+                [data for data in items if not data.obj.is_tradable], today=today
+            ),
+            账户交易流水表={
+                "取到了": False,
+                "原因": "等待 ExperimentLedger projection",
+                "说明": "此占位在模型调用前由 isolated synthetic account 替换。",
+                "账户": None,
+                "当日流水": None,
+            },
+            per_object=per_object,
+            data_window=data_window(items),
+            account=None,
+            objects=snapshots(items, catalog),
+            problems=tuple(problems),
+        )
+
+    def close(self) -> None:
+        """没有 browser session；保留统一 daemon lifecycle 接口。"""
+        return None
+
+
 __all__ = [
     "QUOTE_PAUSE", "KLINE_LIMIT", "CONTEXT_BARS",
     "ACCOUNT_UNCONFIGURED", "ACCOUNT_LOGIN_FAILED", "ACCOUNT_QUERY_FAILED",
     "AccountProblem",
     "ObjectData", "Collector", "is_st_name",
+    "MarketCollector",
     "position_entry", "object_entry", "account_entry", "market_entry",
     "data_window", "snapshots", "scope_entry", "describe_source",
+    "describe_simulation_source",
 ]

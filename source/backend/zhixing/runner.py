@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Final, Mapping, Protocol, Sequence
 
 from . import SYSTEM_NAME, __version__, archive, context, execution, experiment, guards, history, llm, model, prompts
-from . import scheduler, state
+from . import scheduler, simulation, state
 from . import runmode
 from .catalog import Catalog
 from .prompts import HISTORY_NOTE
@@ -189,6 +189,7 @@ def assemble_payload(
     data_window: Mapping[str, str],
     context_text: str,
     context_digest: str,
+    synthetic_results: Mapping[str, simulation.SyntheticExecutionResult] | None = None,
 ) -> dict[str, Any]:
     """把一轮的产物拼成一份归档。**纯函数,不碰磁盘、不看表。**
 
@@ -254,6 +255,20 @@ def assemble_payload(
                 "outcome": "blocked",
                 "submitted_unknown": False,
                 "message": "指令字段无法完成类型规范化,未进入执行层",
+            }
+        synthetic = (synthetic_results or {}).get(instruction_code)
+        if synthetic is not None:
+            item["模拟执行结果"] = {
+                "instruction_code": synthetic.instruction_code,
+                "order_reference": synthetic.order_reference,
+                "order_state": synthetic.state.value,
+                "fill_qty": synthetic.fill_qty,
+                "simulated_execution_price": (
+                    str(synthetic.execution_price)
+                    if synthetic.execution_price is not None else None
+                ),
+                "fee": str(synthetic.fee),
+                "reasons": [dict(reason) for reason in synthetic.reasons],
             }
         指令.append(item)
 
@@ -377,6 +392,9 @@ class Runner:
     #: M0 默认从通用账户/持仓快照推导实验分配；测试或未来独立实验账本可以
     #: 显式注入，仍不依赖任何具体券商返回类型。
     experiment_snapshot: experiment.ExperimentSnapshot | None = None
+    #: M1 isolated synthetic venue。它与 BrokerAdapter 平行而非其实现；仅在
+    #: AuthorizationKind.SIMULATION 下启用，所有资金事实来自 ExperimentLedger。
+    paper_engine: simulation.PaperExecutionEngine | None = None
     #: 时钟。注进来是为了自检能指定"现在是几点几分",不用等。
     clock: Callable[[], datetime] = datetime.now
     system_prompt: str = prompts.SYSTEM_PROMPT
@@ -423,6 +441,18 @@ class Runner:
         catalog = self.store.catalog()
 
         data = self.source.collect(now=now, catalog=catalog)
+
+        references: Mapping[str, simulation.QuoteReference] = {}
+        if self.paper_engine is not None:
+            if self.authorization_kind is not execution.AuthorizationKind.SIMULATION:
+                raise RunnerError("PaperExecutionEngine 只能用于 AuthorizationKind.SIMULATION")
+            references = self.paper_engine.prepare_round(
+                strategy_id=strategy_id,
+                catalog=catalog,
+                snapshots=data.objects,
+                now=now,
+            )
+            data = self._project_synthetic_account(data, catalog=catalog, now=now)
 
         # 采集阶段的问题**立刻并进本轮问题**,不等到最后。放在最前面是因为
         # 它们解释了后面所有的"少了什么":少一个标的的判断、一条指令都没有,
@@ -496,21 +526,57 @@ class Runner:
             )
             for object_id, report in reports.items()
         }
-        policy_snapshot = self.experiment_snapshot or experiment.snapshot_from_validation_context(
-            data.account,
-            data.objects,
-            config=self.experiment_policy.config,
-        )
-        batch = execution.submit_reports(
-            list(reports.values()),
-            auth,
-            journal=archive.ExecutionJournal(self.archive_root),
-            broker_provider=self.broker_provider,
-            now=now,
-            policy=self.experiment_policy,
-            snapshot=policy_snapshot,
-            metadata_by_code=metadata_by_code,
-        )
+        synthetic_results: dict[str, simulation.SyntheticExecutionResult] = {}
+        if self.paper_engine is not None:
+            records: list[execution.ExecutionRecord] = []
+            blocked: list[guards.GuardReport] = []
+            journal = archive.ExecutionJournal(self.archive_root)
+            for object_id, report in reports.items():
+                if not report.ok:
+                    blocked.append(report)
+                metadata = metadata_by_code[report.proposed.instruction_code]
+                record = execution.execute(
+                    report,
+                    auth,
+                    journal=journal,
+                    broker=None,
+                    broker_provider=None,
+                    now=now,
+                    policy=self.experiment_policy,
+                    snapshot=self.paper_engine.ledger.experiment_snapshot(),
+                    metadata=metadata,
+                )
+                records.append(record)
+                if (
+                    report.order is not None
+                    and record.execution_state is execution.ExecutionState.SIMULATED
+                    and record.experiment_policy_result == experiment.PolicyResult.PASS.value
+                ):
+                    synthetic_results[report.proposed.instruction_code] = self.paper_engine.submit(
+                        report.order,
+                        strategy_id=strategy_id,
+                        object_id=object_id,
+                        catalog=catalog,
+                        references=references,
+                        now=now,
+                    )
+            batch = execution.BatchResult(records=tuple(records), blocked=tuple(blocked))
+        else:
+            policy_snapshot = self.experiment_snapshot or experiment.snapshot_from_validation_context(
+                data.account,
+                data.objects,
+                config=self.experiment_policy.config,
+            )
+            batch = execution.submit_reports(
+                list(reports.values()),
+                auth,
+                journal=archive.ExecutionJournal(self.archive_root),
+                broker_provider=self.broker_provider,
+                now=now,
+                policy=self.experiment_policy,
+                snapshot=policy_snapshot,
+                metadata_by_code=metadata_by_code,
+            )
 
         payload = assemble_payload(
             strategy_id=strategy_id,
@@ -535,6 +601,7 @@ class Runner:
             # 可能一条都配不上——这不是 bug,是这项还没对齐。
             context_text=shared.rendered,
             context_digest=shared.digest,
+            synthetic_results=synthetic_results,
         )
         path = archive.write_run(payload, root=self.archive_root)
 
@@ -554,6 +621,41 @@ class Runner:
             已提交数=batch.submitted_count,
             结果不明数=batch.submitted_unknown_count,
             问题=tuple(问题),
+        )
+
+    def _project_synthetic_account(
+        self, data: RoundInput, *, catalog: Catalog, now: datetime
+    ) -> RoundInput:
+        """Map ExperimentLedger facts into the unchanged model-context contract."""
+        assert self.paper_engine is not None
+        ledger = self.paper_engine.ledger
+        policy_snapshot = ledger.experiment_snapshot()
+        projected_objects = dict(data.objects)
+        projected_per_object: dict[str, Any] = {}
+        for object_id, payload in data.per_object.items():
+            instrument = catalog.get(object_id)
+            if instrument is None:
+                projected_per_object[object_id] = payload
+                continue
+            position = ledger.model_position_context(instrument.symbol)
+            entry = dict(payload) if isinstance(payload, Mapping) else {"数据": payload}
+            entry["持仓"] = position
+            projected_per_object[object_id] = entry
+            existing = projected_objects.get(instrument.symbol)
+            if existing is not None:
+                projected_objects[instrument.symbol] = replace(
+                    existing,
+                    available_qty=int(position.get("可用数量") or 0),
+                    holding_qty=int(position.get("数量") or 0),
+                )
+        return replace(
+            data,
+            账户交易流水表=ledger.model_account_context(now=now),
+            per_object=projected_per_object,
+            account=guards.AccountSnapshot(
+                available_cash=policy_snapshot.available_cash_cny
+            ),
+            objects=projected_objects,
         )
 
     # -- 类型规范化 -------------------------------------------------------
@@ -648,6 +750,9 @@ class Runner:
 
     def tick(self) -> RoundResult | None:
         """到点就跑一轮,没到点返回 ``None``。驱动循环调这个。"""
+        if self.paper_engine is not None:
+            # DAY order 到 15:00 后由 daemon heartbeat 过期，不需要增加 LLM 轮次。
+            self.paper_engine.expire_due(now=self.clock())
         execution.reconcile_incomplete(
             archive.ExecutionJournal(self.archive_root), now=self.clock()
         )

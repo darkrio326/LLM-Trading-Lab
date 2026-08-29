@@ -41,10 +41,23 @@
 - `/api/runs`：历史轮次列表、详情与比较。
 - `/api/objects`：研究标的维护。
 - `/api/account`：账户快照读取。
+- `/api/experiment`：M1 isolated synthetic account 的只读、可重建摘要。
 - `/api/usage`：模型用量聚合。
 - 运行设置接口：调度、模型、验证码、券商连接和运行模式配置。
 
 具体请求字段由 `source/frontend/src/api/` 的类型与 HTTP 客户端定义；后端 smoke 测试覆盖成功、空态、错误态、脱敏和写入校验。
+
+### 3.1 Experiment summary
+
+`GET /api/experiment` 不接受写入参数，不连接券商，也不读取 `/api/account` 的真实账户快照。其 `data` 至少包含：
+
+- `initial_cash`、`current_cash`、`available_cash` 与 `nav`；
+- `realized_pnl`、`unrealized_pnl`、`market_value`、`cumulative_fees` 与 `turnover`；
+- `high_water_mark`、`drawdown_pct` 与 `max_drawdown_pct`；
+- `positions` 与 `open_synthetic_orders`；
+- `last_mark_time`、`experiment_start_time` 与 `benchmarks`。
+
+新建但尚未运行首轮的 archive 可返回 1,000 CNY 初始空态，此时时间字段可以为 `null`。第一轮开始前，daemon 会先将初始事实 durable 落盘。
 
 ## 4. 验证码配置边界
 
