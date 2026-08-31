@@ -3,18 +3,18 @@
 # **零第三方依赖。** 这一行不是还没填,是结论——而且是**采集层、登录层、
 # 浏览器控制层全部写完之后**的结论,不是开工时的乐观估计。
 #
-# 三十个业务模块（不计 __init__）全部只用标准库:
+# 核心业务模块（不计 __init__）全部只用标准库:
 #
 #   api archive broker captcha catalog collect context daemon eastmoney
 #   execution experiment guards history index indicators llm login macro model
 #   prompts quotes runmode runner scheduler serve setup_model simulation state
-#   tradingdays webdriver
+#   tradingdays webdriver xtp_pro
 #
 # 这个文件存在的意义就是把"零依赖"写下来。没有它,"没装什么"和
 # "忘了记"在仓库里长得一模一样。
 #
 # 运行:
-#   python -m tests.smoke                       # 自检,515 项
+#   python -m tests.smoke                       # 自检,533 项
 #   python -m zhixing.serve  --archive-root ... # 接口服务(默认只绑 127.0.0.1)
 #   python -m zhixing.daemon --archive-root ... # 轮次驱动(不监听端口)
 #
@@ -23,6 +23,9 @@
 #
 # 要求 Python ≥ 3.11(用到 `X | None` 写法和 datetime.fromisoformat 的
 # 完整 ISO 解析)。开发机实测 3.14,服务器(Ubuntu 24.04)是 3.12.3。
+# XTP Pro 的 deterministic adapter tests 仍只用标准库；credential-gated
+# network smoke 另行加载券商官方提供的 Linux x86_64 / Python 3.9 native SDK，
+# 不把 SDK binary 或 pip dependency 加进本仓库。
 
 
 # ── 逐层为什么没引入 ────────────────────────────────────────────────

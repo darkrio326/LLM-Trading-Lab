@@ -4,7 +4,58 @@
 
 LLM-Trading-Lab 是从 [`mivus1128/zhixing`](https://github.com/mivus1128/zhixing) fork 出来的独立实验项目，保留 upstream attribution。项目要复刻并验证 Zhixing 当前的 LLM-driven trading hypothesis：在不重新设计策略的前提下，观察它能否在受控的小额实验中持续产生盈利。
 
-M0 只建立执行安全基线，不是收益实验本身。M0 通过也只表示 **SAFE FOR SIMULATION**，不证明策略有盈利能力，也不表示已获准进行真钱交易。M1 在该基线上建立可持续运行的 isolated paper-trading runtime，用来产生可长期复盘的 synthetic account facts；M1 同样不证明盈利能力，不授权真钱。
+M0 只建立执行安全基线，不是收益实验本身。M0 通过也只表示 **SAFE FOR SIMULATION**，不证明策略有盈利能力，也不表示已获准进行真钱交易。M1 在该基线上建立可持续运行的 isolated paper-trading runtime，用来产生可长期复盘的 synthetic account facts；M2 只负责将它配置为经过硬门禁、可长期运行的 Experiment #1。三者都不证明盈利能力，不授权真钱。
+
+## M2 Experiment #1 activation contract
+
+固定实验身份：
+
+- `experiment_id = llm-trading-lab-exp1`
+- display name = `Experiment #1 — Zhixing Reproduction`
+- baseline main = `323e0b2dfddea0ce6008c231f88edfd7b08c647e`
+- initial synthetic NAV / CASH benchmark = 1,000 CNY
+- buy-and-hold benchmark = `SH_510300`
+
+固定 tradable universe 只有以下三项，不自动扩展：
+
+| object_id | 名称 | asset_type | lot_size | turnover_mode |
+|---|---|---|---:|---|
+| `SH_510300` | 沪深300ETF | ETF | 100 | T+1 |
+| `SZ_159915` | 创业板ETF | ETF | 100 | T+1 |
+| `SH_512880` | 证券ETF | ETF | 100 | T+1 |
+
+六轮仍为 09:35、10:00、11:15、13:15、14:00、14:45（Asia/Shanghai），沿用原有 scheduler 的 deterministic jitter/window 和“错过不补跑”语义。M2 activation 发生在交易日中途时，只从之后第一个合法 slot 开始。
+
+### Model regime
+
+Experiment #1 初始 model regime 固定为 DeepSeek V4 Pro：
+
+- provider = `DeepSeek`
+- model family = `DeepSeek V4`
+- variant = `Pro`
+- protocol = `openai_chat`
+- exact model identifier = runtime endpoint 实际接受并回显核对的 V4 Pro identifier
+
+启动前必须用真实 endpoint 完成一个 JSON contract smoke，并用与正式实验相同的三份原始 prompt/context 串行完成一整轮 inference。若 endpoint 返回 model echo，它必须与 requested exact identifier 一致并进入启动 metadata；完整三标的一轮 wall-clock operational target 为 900 秒，超过时返回 `MODEL_LATENCY_BLOCKING`。没有 endpoint/name/Key 时保持 `READY_BUT_MODEL_UNCONFIGURED`，不伪造结果。
+
+DeepSeek V4 Flash 只是 Owner 可在未来另行授权的候选，不是自动 fallback。任何收益表现都不能触发换模。实验开始后通用设置接口不能静默切换 model/endpoint/credential；未来 Owner-authorized switch 必须在同一 ledger 追加 `MODEL_REGIME_CHANGED`，记录 from/to exact model、timestamp、reason 与 `nav_at_switch`，且不重置现金、持仓或 NAV。daemon 会核对私有 model config 与 durable current regime；不一致时停止轮次。
+
+### Explicit start and durable runtime
+
+未启动的 M2 ledger 只读返回 1,000 CNY、空持仓和 `activation_state=NOT_STARTED`，daemon 到达 slot 也不能自动初始化。唯一 activation 入口必须先通过：
+
+- clean worktree 与 exact local/origin main baseline；
+- 完整 `scripts/verify.sh`、`VERIFICATION_LOCK=True`；
+- `AuthorizationKind.SIMULATION`、`broker_provider=None`、无 broker credential；
+- exact universe、six-slot schedule 与 Asia/Shanghai；
+- 1,000 CNY initial cash/NAV、空持仓/委托；
+- 三项当日有效真实公开行情；
+- DeepSeek V4 Pro JSON/echo/三标的一轮 latency probes；
+- `runtime`/`archives` Docker named volumes、初始 `GET /api/experiment` 与 API/Web recreate 后相同 ledger projection。
+
+全部通过后才追加唯一的 `EXPERIMENT_STARTED` append-only fact，记录 experiment identity、start timestamp、main SHA、非机密 model identity/echo、universe、schedule、initial NAV、fee assumptions、benchmark、simulation mode、verification lock 与 storage proof。Key、endpoint、broker/browser/cookie/session 不进入该 fact。重启只重建已有实验，不生成新 start。
+
+M2 使用不包含 browser 的 `experiment` Compose profile。daemon 为 `MarketCollector`，API 固定 `broker_provider=None`；`runtime` 卷保存私有模型/catalog/schedule，`archives` 卷保存 round archive、M0 execution journal 和 M1 ledger。容器重建不得重置 synthetic account。
 
 ## M1 isolated simulation runtime
 
@@ -114,7 +165,7 @@ Policy 输入是通用 `ExperimentSnapshot`，不依赖任何券商响应类型�
 
 ## Strategy fidelity
 
-M0/M1 不修改以下策略语义：
+M0/M1/M2 不修改以下策略语义：
 
 - `prompts.SYSTEM_PROMPT` 与 `prompts.OUTPUT_SPEC`；
 - indicators、行情采集和技术指标语义；
@@ -132,10 +183,13 @@ M0/M1 不修改以下策略语义：
 - 非机密 `provider` identity；
 - `place_order(ValidatedOrder)`；
 - `cancel_order(order_reference)`。
+- `query_exact_order` / `query_orders` / `query_trades`；
+- `query_asset` / `query_positions`；
+- broker-neutral order status、order/trade/position/asset models。
 
 `broker_provider = "eastmoney"` 只说明某条 execution fact 实际使用了 upstream 当前 adapter。Eastmoney 不是本项目唯一或长期固定券商；Eastmoney URL、页面、Selenium 和会话细节不得进入 experiment policy、journal 或核心 execution contract。
 
-M0 不实现 GuosenBroker，不接入国信、iQuant、GTrade 或任何其他真实券商。后续 broker integration 必须作为独立范围设计，并重新取得 Owner 对凭据、真实账户和财务 mutation 的明确授权。
+M0 不实现 GuosenBroker，不接入国信、iQuant 或 GTrade。M2 的 `XtpProBroker` 是另行授权的官方股票测试环境 integration，默认只读且不进入 experiment runtime；详细 contract、identifier 和 reconciliation mapping 见 [XTP_PRO.md](XTP_PRO.md)。真实账户和任何财务 mutation 仍需 Owner 对 exact scope 单独明确授权。
 
 ## Execution safety 与状态机
 
@@ -168,13 +222,13 @@ journal 位于既有 `archive/_execution/journal/` 边界内。每次状态迁�
 
 durable facts 记录 strategy、instruction、object、完整 proposed order、model/provider/confidence、policy 结果与原因、authorization kind、execution state、非机密 broker provider、order reference/receipt 和三个时间戳。不得记录券商账户明文、密码、API Key、Cookie、browser session 或 credential。
 
-## M0 invariants 与 M1 当前边界
+## M0/M1 invariants 与 M2 当前边界
 
 允许：
 
 - FakeBroker / TestBroker；
 - isolated synthetic account 上的 SIMULATION；
-- 真实公开行情采集、原始 LLM 决策与六轮调度；
+- 真实公开行情采集、固定 DeepSeek V4 Pro 的原始 LLM 决策与六轮调度；
 - backend smoke、frontend check、公开内容扫描；
 - 文档、commit、push 与 Draft PR。
 
@@ -187,4 +241,4 @@ durable facts 记录 strategy、instruction、object、完整 proposed order、m
 - 修改 LLM strategy semantics；
 - 收益优化、智能选股或多模型 leaderboard。
 
-当前可持续产生的只是 synthetic 1,000 CNY paper-trading facts。真实 1,000 CNY 实验需要后续 Owner 单独授权，并先完成所选 broker 的独立 integration、实验资金隔离与 reconciliation 设计。
+M2 只有在 activation hard gates 全部通过并写入 `EXPERIMENT_STARTED` 后，才可持续产生 synthetic 1,000 CNY paper-trading facts；在此之前必须明确保持未启动或 BLOCKED。真实 1,000 CNY 实验需要后续 Owner 单独授权，并先完成所选 broker 的独立 integration、实验资金隔离与 reconciliation 设计。

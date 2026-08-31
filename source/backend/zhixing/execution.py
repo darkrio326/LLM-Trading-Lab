@@ -69,6 +69,86 @@ class Outcome(str, Enum):
     RECONCILE_REQUIRED = "reconcile_required"
 
 
+class BrokerOrderStatus(str, Enum):
+    """Broker-neutral lifecycle state returned by adapter read APIs."""
+
+    ACCEPTED_SUBMITTED = "accepted_submitted"
+    REJECTED = "rejected"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    RECONCILE_REQUIRED = "reconcile_required"
+
+
+@dataclass(frozen=True)
+class BrokerOrder:
+    """One broker order without account, session, endpoint, or credential data."""
+
+    provider: str
+    order_reference: str
+    status: BrokerOrderStatus
+    market: str
+    symbol: str
+    side: str
+    quantity: int
+    filled_quantity: int
+    remaining_quantity: int
+    limit_price: Decimal
+    client_order_reference: str | None = None
+    broker_local_reference: str | None = None
+    exchange_order_reference: str | None = None
+    cancel_order_reference: str | None = None
+    provider_status: str | None = None
+    provider_submit_status: str | None = None
+    terminal: bool = False
+
+
+@dataclass(frozen=True)
+class BrokerTrade:
+    """One execution report mapped to stable broker-neutral identifiers."""
+
+    provider: str
+    trade_reference: str
+    order_reference: str
+    market: str
+    symbol: str
+    side: str
+    quantity: int
+    price: Decimal
+    amount: Decimal
+    client_order_reference: str | None = None
+    broker_local_reference: str | None = None
+    exchange_order_reference: str | None = None
+    traded_at: str | None = None
+
+
+@dataclass(frozen=True)
+class BrokerAsset:
+    """Account totals needed for read-only reconciliation; identity is intentionally absent."""
+
+    provider: str
+    total_asset: Decimal
+    buying_power: Decimal
+    security_asset: Decimal
+    cash_balance: Decimal
+    withholding_amount: Decimal
+
+
+@dataclass(frozen=True)
+class BrokerPosition:
+    """One position without shareholder/account identifiers."""
+
+    provider: str
+    market: str
+    symbol: str
+    name: str
+    total_quantity: int
+    sellable_quantity: int
+    average_price: Decimal
+    market_value: Decimal
+    unrealized_pnl: Decimal
+
+
 REPLAY_BLOCKING_STATES = frozenset({
     ExecutionState.SUBMITTED,
     ExecutionState.SUBMITTED_UNKNOWN,
@@ -118,10 +198,12 @@ class ExecutionRecord:
 
 
 class BrokerAdapter(Protocol):
-    """Generic write boundary shared by every current or future broker integration.
+    """Generic broker boundary shared by every current or future integration.
 
     ``provider`` is a non-secret stable identity used for audit and reconciliation. Every broker
-    needs this semantic; no URL, page, Selenium, or provider-specific field belongs here.
+    needs this semantic; no URL, page, Selenium, session, account identity, or provider-specific
+    response object belongs here.  Writes retain the existing at-most-once coordinator semantics;
+    reads are explicit query/reconciliation operations.
     """
 
     provider: str
@@ -140,6 +222,41 @@ class BrokerAdapter(Protocol):
         The execution coordinator provides instruction_code-level at-most-once invocation and
         replay safety.
         """
+        ...
+
+    def query_exact_order(self, order_reference: str) -> BrokerOrder | None:
+        """Return one exact order, or ``None`` when the broker confirms no matching row."""
+        ...
+
+    def query_orders(
+        self,
+        *,
+        symbol: str = "",
+        begin: datetime | None = None,
+        end: datetime | None = None,
+    ) -> Sequence[BrokerOrder]:
+        """Return orders matching broker-neutral filters."""
+        ...
+
+    def query_trades(
+        self,
+        *,
+        order_reference: str | None = None,
+        symbol: str = "",
+        begin: datetime | None = None,
+        end: datetime | None = None,
+    ) -> Sequence[BrokerTrade]:
+        """Return trade records, optionally for one exact broker order reference."""
+        ...
+
+    def query_asset(self) -> BrokerAsset:
+        """Return the current account totals without account identity fields."""
+        ...
+
+    def query_positions(
+        self, *, symbol: str = "", market: str = ""
+    ) -> Sequence[BrokerPosition]:
+        """Return current positions without shareholder/account identity fields."""
         ...
 
 
@@ -960,6 +1077,7 @@ def submit_reports(
 
 __all__ = [
     "AuthorizationKind", "Authorization", "ExecutionMetadata", "ExecutionState", "Outcome",
+    "BrokerOrderStatus", "BrokerOrder", "BrokerTrade", "BrokerAsset", "BrokerPosition",
     "ExecutionRecord", "BrokerAdapter", "REPLAY_BLOCKING_STATES", "record_entry", "execute",
     "submit", "reconcile_incomplete", "BatchResult", "submit_reports",
 ]

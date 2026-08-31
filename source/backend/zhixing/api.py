@@ -962,13 +962,21 @@ def put_model(app: App, req: Request) -> Response:
     if not (submitted or current.secret):
         return fail(400, "SECRET_REQUIRED", "还没有配置过密钥,这次必须填。")
 
-    # 空密钥 = 不改。理由同验证码接口:GET 不下发明文,前端没有原值可回填。
-    app.store.save_model(
-        state.ModelSettings(
-            endpoint=endpoint, name=name, provider=provider, protocol=protocol,
-            secret=submitted or current.secret,
-        )
+    proposed = state.ModelSettings(
+        endpoint=endpoint, name=name, provider=provider, protocol=protocol,
+        secret=submitted or current.secret,
     )
+    if app.experiment_ledger is not None and app.experiment_ledger.is_started():
+        if proposed != current:
+            return fail(
+                409,
+                "MODEL_REGIME_CHANGE_REQUIRED",
+                "实验已开始；模型或 endpoint/credential 变更必须由 Owner 明确授权，"
+                "并与 durable MODEL_REGIME_CHANGED fact 同步完成。",
+            )
+
+    # 空密钥 = 不改。理由同验证码接口:GET 不下发明文,前端没有原值可回填。
+    app.store.save_model(proposed)
     logger.info(
         "模型配置已更新:%s @ %s(密钥%s)",
         name, provider, "已变更" if submitted else "未变更",

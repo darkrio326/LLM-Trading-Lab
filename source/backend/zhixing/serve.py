@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import SYSTEM_NAME, __version__, api, collect, scheduler, simulation, state, tradingdays
+from . import SYSTEM_NAME, __version__, activation, api, collect, scheduler, state, tradingdays
 
 logger = logging.getLogger("zhixing.serve")
 
@@ -208,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         archive_root=archive_root,
         data_source=collect.describe_simulation_source,
         broker_provider=None,
-        experiment_ledger=simulation.ExperimentLedger(archive_root),
+        experiment_ledger=activation.experiment_ledger(archive_root),
     )
 
     # 交易日历够不够用。**只警告,不拒绝启动。**

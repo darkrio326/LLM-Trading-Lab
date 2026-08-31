@@ -31,7 +31,9 @@ jobs:
 
       - name: Run backend smoke suite
         working-directory: source/backend
-        run: python -m tests.smoke
+        run: |
+          python -m tests.smoke
+          python -m tests.xtp_pro_adapter
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

@@ -2,12 +2,60 @@
 
 ## 前置条件
 
-- Linux 主机，建议至少为 Chromium 留出 1 GiB 内存。
+- Linux 或 macOS Docker 主机。只有 upstream `collector` profile 会启动 Chromium；M2 experiment profile 不需要 browser。
 - Docker Engine。
 - Docker Compose v2，命令形式为 `docker compose`。
 - 首次启动时可以访问容器镜像仓库。
 
 项目不要求在宿主机安装 Python、Node.js、Nginx 或 Chromium。
+
+## M2 Experiment #1 runtime
+
+Experiment #1 使用固定 Compose identity `llm-trading-lab-exp1`、独立的 `runtime`/`archives` 命名卷和不含 browser 的 `experiment` profile：
+
+```bash
+bash scripts/start.sh experiment
+docker compose -f deploy/compose.yaml --profile experiment exec -T api \
+  python -m zhixing.activation prepare \
+  --archive-root /opt/zhixing/data/archives \
+  --runtime-dir /opt/zhixing/data/runtime
+```
+
+`prepare` 只在私有 runtime 为空时写入 Owner 固定的三只 T+1 ETF 和六个时点；已有配置漂移时 fail closed，不覆盖。随后在本机工作台仅配置模型字段：
+
+- provider：`DeepSeek`
+- protocol：`openai_chat`
+- exact model identifier：endpoint 实际提供的 DeepSeek V4 Pro identifier（必须明确为 V4 Pro，不能是 Flash）
+- endpoint 与 API key：仅保存到私有 `runtime` 卷
+
+不要把 endpoint 或 Key 写进 `.env`、Git、命令行参数、archive 或日志。也不要填写任何券商、验证码或 browser credential。
+
+准备状态可只读检查：
+
+```bash
+docker compose -f deploy/compose.yaml --profile experiment exec -T api \
+  python -m zhixing.activation status \
+  --archive-root /opt/zhixing/data/archives \
+  --runtime-dir /opt/zhixing/data/runtime
+```
+
+在交易日、三只 ETF 都有当日行情时执行唯一 activation 入口：
+
+```bash
+bash scripts/activate_experiment.sh
+```
+
+该脚本在写入 start fact 前依次确认 worktree clean、local/origin main baseline、完整 `scripts/verify.sh`、Compose identity、browser 未启动、named volumes、初始 `GET /api/experiment` 以及 API/Web recreate 后账本投影不变。随后才会用真实 DeepSeek V4 Pro endpoint 验证 JSON contract、model echo（若 endpoint 返回）和三标的正式规模整轮 inference；整轮超过 900 秒会返回 `MODEL_LATENCY_BLOCKING`。任一项失败都不会形成 `EXPERIMENT_STARTED`。
+
+启动成功后，`EXPERIMENT_STARTED`、1,000 CNY 初始 NAV、exact model identifier、model echo、三标的 universe、六轮 schedule、fee/benchmark 假设和 verification lock 会作为 append-only ledger fact 保存。DeepSeek V4 Flash 不会自动 fallback；实验开始后的 model/endpoint/credential 变更由 API 拒绝，直到 Owner 另行授权并同步追加 `MODEL_REGIME_CHANGED` fact。
+
+可以独立复核容器重建不改变 ledger projection：
+
+```bash
+bash scripts/check_experiment_runtime.sh
+```
+
+此 runtime 始终使用 `MarketCollector`、`AuthorizationKind.SIMULATION` 和 `broker_provider=None`。它不是 production deployment，也不授权真实交易。
 
 ## 一键启动
 
@@ -41,7 +89,7 @@ cp .env.example .env
 
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `COMPOSE_PROJECT_NAME` | `zhixing-v3` | Compose 项目名及数据卷前缀 |
+| `COMPOSE_PROJECT_NAME` | `llm-trading-lab-exp1` | Compose 项目名及数据卷前缀 |
 | `ZHIXING_WEB_HOST` | `127.0.0.1` | 网页监听地址 |
 | `ZHIXING_WEB_PORT` | `18765` | 网页端口 |
 | `ZHIXING_BROWSER_IMAGE` | 已验证的 Chromium 镜像 digest | 浏览器容器 |
@@ -50,7 +98,7 @@ cp .env.example .env
 | `ZHIXING_API_IMAGE` | `zhixing-api:3.260817.00` | 本地 API 镜像标签 |
 | `ZHIXING_WEB_IMAGE` | `zhixing-web:3.260817.00` | 本地 Web 镜像标签 |
 
-`.env` 只用于非机密部署参数。模型 Key、验证码 Key、资金账号和交易密码不要写入 `.env`，应在网页“运行设置”中填写。
+`.env` 只用于非机密部署参数。模型 Key、验证码 Key、资金账号和交易密码不要写入 `.env`。M2 只允许在本机网页“运行设置”中填写模型 endpoint/name/provider/protocol/Key；不得配置真实券商或验证码服务。
 
 ## 远程服务器访问
 
@@ -66,13 +114,13 @@ ssh -L 18765:127.0.0.1:18765 user@server
 
 ## 首次运行设置
 
-完整 Compose 中的浏览器服务名为 `browser`。在券商连接设置里填写：
+以下内容只适用于 upstream 完整 profile，不属于 M2。完整 Compose 中的浏览器服务名为 `browser`。在券商连接设置里填写：
 
 ```text
 http://browser:4444/wd/hub
 ```
 
-随后先在“交易对象”页添加标的，再按页面提示配置模型服务、验证码识别方式与备用服务、券商凭据、调度时点和运行模式。所有个人值都写入 `runtime` 卷。
+随后可按 upstream 页面配置。Experiment #1 不使用这条路径，也不得录入真实券商 credential；它的 universe 与 schedule 由 `zhixing.activation prepare` 固定写入。
 
 验证码备用服务按数组位置关联已保存密钥。网页支持追加备用项；修改已有项的识别方式、地址或模型时必须同时填写新密钥，并且不提供已保存项的重排或删除操作，以免空密钥错位沿用。
 
@@ -116,9 +164,13 @@ bash scripts/start.sh
 docker compose -f deploy/compose.yaml --profile collector ps
 docker compose -f deploy/compose.yaml --profile collector logs --tail=200
 docker compose -f deploy/compose.yaml --profile collector config
+docker compose -f deploy/compose.yaml --profile experiment ps
+docker compose -f deploy/compose.yaml --profile experiment logs --tail=200
+docker compose -f deploy/compose.yaml --profile experiment config
 ```
 
 - `data-init` 显示 `Exited (0)` 是正常状态，它只负责初始化数据卷权限。
 - 浏览器长时间不健康时，先检查主机内存和镜像下载状态。
 - 网页可打开但没有采集轮次时，确认使用的是默认 `full` 模式，而不是 `web` 模式。
+- Experiment #1 没有轮次时，先检查 activation status；`READY_BUT_MODEL_UNCONFIGURED`、`MARKET_DATA_NOT_READY`、`MODEL_ROUTE_MISMATCH` 或 `MODEL_LATENCY_BLOCKING` 都不会自动降级或补跑。
 - 修改 `.env` 中的 `COMPOSE_PROJECT_NAME` 会切换到另一组空白数据卷。

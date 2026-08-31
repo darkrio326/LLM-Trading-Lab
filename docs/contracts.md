@@ -41,7 +41,7 @@
 - `/api/runs`：历史轮次列表、详情与比较。
 - `/api/objects`：研究标的维护。
 - `/api/account`：账户快照读取。
-- `/api/experiment`：M1 isolated synthetic account 的只读、可重建摘要。
+- `/api/experiment`：M1/M2 isolated synthetic account 的只读、可重建摘要。
 - `/api/usage`：模型用量聚合。
 - 运行设置接口：调度、模型、验证码、券商连接和运行模式配置。
 
@@ -56,8 +56,9 @@
 - `high_water_mark`、`drawdown_pct` 与 `max_drawdown_pct`；
 - `positions` 与 `open_synthetic_orders`；
 - `last_mark_time`、`experiment_start_time` 与 `benchmarks`。
+- `activation_state`、`experiment_metadata` 与 `current_model_regime`。
 
-新建但尚未运行首轮的 archive 可返回 1,000 CNY 初始空态，此时时间字段可以为 `null`。第一轮开始前，daemon 会先将初始事实 durable 落盘。
+M2 新建但尚未 activation 的 archive 返回 1,000 CNY 初始空态、`activation_state="NOT_STARTED"`，时间和 metadata 字段可以为 `null`，且不会因为 daemon 到达 slot 自动初始化。只有启动硬门禁全部通过后，activation coordinator 才追加唯一的 `EXPERIMENT_STARTED` fact；后续重启从该 fact 重建相同实验。实验开始后，通用模型设置接口不得静默改变 model regime。
 
 ## 4. 验证码配置边界
 

@@ -8,19 +8,27 @@
                          | +-> runtime 卷
                          +---> archives 卷
 
-daemon -> browser (Selenium Chromium)
+daemon (MarketCollector)
    |\
    | +-> runtime 卷
    +---> archives 卷
+
+browser (upstream collector profile 保留；M2 experiment profile 不启动)
 ```
 
 - `web`：托管 `frontend-dist`，并把 `/api/` 请求转发给 `api`。
 - `api`：提供状态、历史、配置与工作台接口。
 - `daemon`：独立运行计划轮次；与 API 分进程，避免轮次异常影响网页可用性。
-- `browser`：提供独立的远程 Chromium 会话。
+- `browser`：upstream `collector` profile 保留的独立远程 Chromium；M2 不使用。
 - `data-init`：短暂运行一次，为非 root API 用户初始化 Docker 卷权限。
 
 API 和 daemon 使用同一个后端镜像，但入口命令不同。它们共享运行状态和归档卷；浏览器容器不复用其他项目的会话。
+
+M2 Experiment #1 使用 `experiment` Compose profile。该 profile 的 daemon 直接使用 `MarketCollector` 获取公开行情，并固定为 `AuthorizationKind.SIMULATION`、`broker_provider=None`；它不启动也不依赖 `browser`。上图中的 browser 仅表示公开 compose 中仍保留的 upstream `collector` profile，不属于 M2 runtime。
+
+`XtpProBroker` 是单独的 test-environment adapter，不接入上述默认 daemon/API 构造路径。它只在显式的 credential-gated smoke 中从仓库外 private config 加载官方 SDK，默认 `writes_enabled=False`；`PaperExecutionEngine` 仍与 `BrokerAdapter` 平行且完全隔离。详见 [XTP_PRO.md](XTP_PRO.md)。
+
+`runtime` 命名卷保存私有模型配置、catalog、schedule 与运行状态；`archives` 命名卷保存 round archives、execution journal 和 `ExperimentLedger`。`EXPERIMENT_STARTED` 是 ledger 中的 append-only fact，不是容器状态；API/Web recreate 不会创建新实验或重置 synthetic NAV。
 
 ## 源码与发布产物
 

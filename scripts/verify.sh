@@ -23,6 +23,7 @@ cmp "$PROJECT_ROOT/deploy/web.Dockerfile" "$PROJECT_ROOT/source/deploy/web.Docke
 (
   cd "$PROJECT_ROOT/source/backend"
   PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m tests.smoke
+  PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m tests.xtp_pro_adapter
 )
 
 if ! command -v npm >/dev/null 2>&1; then
@@ -41,9 +42,9 @@ diff -qr "$PROJECT_ROOT/source/frontend/dist" "$PROJECT_ROOT/frontend-dist"
 COMPOSE_VALIDATED=0
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   if [ -f "$PROJECT_ROOT/.env" ]; then
-    docker compose --env-file "$PROJECT_ROOT/.env" -f "$PROJECT_ROOT/deploy/compose.yaml" --profile collector config >/dev/null
+    docker compose --env-file "$PROJECT_ROOT/.env" -f "$PROJECT_ROOT/deploy/compose.yaml" --profile collector --profile experiment config >/dev/null
   else
-    docker compose -f "$PROJECT_ROOT/deploy/compose.yaml" --profile collector config >/dev/null
+    docker compose -f "$PROJECT_ROOT/deploy/compose.yaml" --profile collector --profile experiment config >/dev/null
   fi
   COMPOSE_VALIDATED=1
 else

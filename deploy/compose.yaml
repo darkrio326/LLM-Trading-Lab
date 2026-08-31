@@ -1,4 +1,4 @@
-name: ${COMPOSE_PROJECT_NAME:-zhixing-v3}
+name: ${COMPOSE_PROJECT_NAME:-llm-trading-lab-exp1}
 
 x-api-image: &api-image
   image: ${ZHIXING_API_IMAGE:-zhixing-api:3.260817.00}
@@ -84,12 +84,11 @@ services:
     <<: *api-image
     profiles:
       - collector
+      - experiment
     restart: unless-stopped
     depends_on:
       data-init:
         condition: service_completed_successfully
-      browser:
-        condition: service_healthy
     command:
       - python
       - -m
@@ -156,6 +155,8 @@ services:
       test:
         - CMD
         - wget
+        - -Y
+        - "off"
         - -qO
         - /dev/null
         - http://127.0.0.1:8080/api/status
