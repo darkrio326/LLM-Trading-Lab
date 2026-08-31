@@ -34,7 +34,9 @@ Python 3.9.13 与 Boost 1.80，并要求 Linux x86_64。SDK 和原生库不 vend
 官方 Git 仓库的 Linux binary 目录不包含其动态依赖的 Boost 1.80 shared
 libraries；private runtime 必须另行提供 exact 1.80 runtime。不得把系统可得的
 其他 Boost 版本改 SONAME 后冒充兼容依赖，ABI import 失败必须按 SDK unavailable
-报告。
+报告。官方 CentOS binding 使用旧 libstdc++ string ABI；隔离 Boost runtime 需要
+使用与其一致的 `_GLIBCXX_USE_CXX11_ABI=0` 构建。仅有 import 成功仍不足以证明
+ABI 可用，必须继续验证 `createTraderApi` 与 `createQuoteApi` 的参数转换。
 
 宿主机不是该组合时，应使用隔离的 Linux/amd64 Python 3.9 runtime；不能把
 “源码可导入”或“容器可启动”冒充为 test login 成功。
@@ -99,5 +101,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m tests.xtp_pro_test_environment
 ```
 
 第二条命令依次验证 native SDK/Python、trader test login、asset、positions、orders、
-exact order（账户已有委托时）、trades 和 depth market data。它不调用
-`place_order` / `cancel_order`；输出中的 `financial_write_calls` 固定为 `0`。
+exact order（账户已有委托时）、trades、quote test login，以及 `SH_510300`、
+`SZ_159915`、`SH_512880` 三个固定公开标的的 depth market data。配置中的
+`market_data_probe` 保留用于旧 private config 兼容，但不能缩小这三个 smoke 目标。
+它不调用 `place_order` / `cancel_order`；输出中的 `financial_write_calls` 固定为 `0`。

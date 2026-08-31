@@ -28,6 +28,11 @@ DEFAULT_CONFIG = Path.home() / ".config" / "llm-trading-lab" / "xtp-pro-test.jso
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 PRIVATE_FIELDS = frozenset(("account_id", "branch_pbu"))
 QUOTE_EXCHANGE = {"SH": 1, "SZ": 2}
+MARKET_DATA_TARGETS = (
+    ("SH", "510300"),
+    ("SZ", "159915"),
+    ("SH", "512880"),
+)
 
 
 class SmokeError(RuntimeError):
@@ -382,10 +387,8 @@ class ReadOnlySdk(object):
             "trades", reqid, pending, self.trader.queryTrades(request, self.session, reqid)
         )
 
-    def market_data(self):
+    def market_data(self, market, symbol):
         self.connect_quote()
-        market = self.config["probe_market"]
-        symbol = self.config["probe_symbol"]
         event = threading.Event()
         self.quote_events[(market, symbol)] = event
         tickers = [{"ticker": symbol}]
@@ -437,7 +440,12 @@ def main():
         "order_query": "not_run",
         "exact_order_query": "not_run",
         "trade_query": "not_run",
+        "quote_login": "not_run",
         "market_data": "not_run",
+        "market_data_targets": {
+            "%s_%s" % (market, symbol): "not_run"
+            for market, symbol in MARKET_DATA_TARGETS
+        },
         "financial_write_calls": 0,
     }
     config = stage(report, "private_config", load_config)
@@ -468,7 +476,29 @@ def main():
         else:
             report["exact_order_query"] = "not_applicable_no_orders"
         stage(report, "trade_query", client.query_trades)
-        stage(report, "market_data", client.market_data)
+        stage(report, "quote_login", client.connect_quote)
+        if report["quote_login"] == "success":
+            for market, symbol in MARKET_DATA_TARGETS:
+                label = "%s_%s" % (market, symbol)
+                try:
+                    client.market_data(market, symbol)
+                except Exception as exc:
+                    report["market_data_targets"][label] = "failed"
+                    report.setdefault("market_data_error_types", {})[label] = (
+                        exc.__class__.__name__
+                    )
+                else:
+                    report["market_data_targets"][label] = "success"
+            report["market_data"] = (
+                "success"
+                if all(
+                    value == "success"
+                    for value in report["market_data_targets"].values()
+                )
+                else "failed"
+            )
+        else:
+            report["market_data"] = "failed"
     finally:
         client.close()
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
@@ -479,6 +509,7 @@ def main():
         "position_query",
         "order_query",
         "trade_query",
+        "quote_login",
         "market_data",
     )
     return 0 if all(report.get(name) == "success" for name in required) else 1
