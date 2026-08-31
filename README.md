@@ -1,6 +1,6 @@
 # LLM-Trading-Lab（知行 Zhixing 独立实验 fork）
 
-本仓库 fork 自 [`mivus1128/zhixing`](https://github.com/mivus1128/zhixing)，用于复刻并验证其 LLM-driven trading 方法。M2 将 M1 的 1,000 CNY isolated synthetic account 建立为显式、硬门禁的长期实验 runtime；只有真实公开行情、DeepSeek V4 Pro endpoint、三标的整轮 inference 和 durable volume 全部通过后，才会追加唯一的 `EXPERIMENT_STARTED` fact。源码 verification lock 保持生效，不授权配置真实券商账号、真实下单、unattended live trading 或 production deployment。实验边界与归因见 [docs/EXPERIMENT.md](docs/EXPERIMENT.md)。
+本仓库 fork 自 [`mivus1128/zhixing`](https://github.com/mivus1128/zhixing)，用于复刻并验证其 LLM-driven trading 方法。M2 将 M1 的 1,000 CNY isolated synthetic account 建立为显式、硬门禁的长期实验 runtime；只有真实公开行情、DeepSeek V4 Pro endpoint、三标的整轮 inference 和 durable volume 全部通过后，才会追加唯一的 `EXPERIMENT_STARTED` fact。源码 verification lock 保持生效。当前另有独立、只读的 XTP Pro 官方股票测试环境 integration；它不接真实资金账户、不提交测试订单，也不授权 unattended live trading 或 production deployment。实验边界与归因见 [docs/EXPERIMENT.md](docs/EXPERIMENT.md)，XTP 边界见 [docs/XTP_PRO.md](docs/XTP_PRO.md)。
 
 知行是第三代自托管交易研究与自动化工作台。项目包含 Python 后端、React 前端、独立浏览器容器和 Docker Compose 部署配置。
 
@@ -60,7 +60,7 @@ ssh -L 18765:127.0.0.1:18765 user@server
 1. 在“交易对象”页添加需要研究或运行的标的；公开版不会预置个人清单。
 2. 模型服务的接口地址、协议、模型名称和 Key。
 3. M2 会把调度固定为 09:35、10:00、11:15、13:15、14:00、14:45（Asia/Shanghai）；daemon 始终以 `AuthorizationKind.SIMULATION` 更新 synthetic account，运行模式不会解除真实交易锁。
-4. upstream 验证码与券商连接设置仍保留于界面，但 M2 不使用它们；**不得在这里录入真实账号、交易密码或其他券商 credential**。
+4. upstream 验证码与券商连接设置仍保留于界面，但 M2 experiment runtime 不使用它们；**不得在这里录入真实账号、交易密码或其他券商 credential**。XTP Pro test credential 只使用仓库外的 private runtime config，见 [docs/XTP_PRO.md](docs/XTP_PRO.md)。
 
 这些值保存在 Docker 的私有 `runtime` 卷中，不写入源码目录，也不通过 `.env` 提交。重新构建镜像不会自动删除它们。
 
@@ -86,12 +86,16 @@ bash scripts/verify.sh
 
 ## 开发
 
-后端仅使用 Python 标准库：
+核心后端与确定性测试仅使用 Python 标准库：
 
 ```bash
 cd source/backend
 PYTHONDONTWRITEBYTECODE=1 python -m tests.smoke
+PYTHONDONTWRITEBYTECODE=1 python -m tests.xtp_pro_adapter
 ```
+
+credential-gated 的 XTP Pro 测试环境网络 smoke 不属于 CI，必须在官方支持的
+Linux x86_64 / Python 3.9 runtime 中单独执行；它不会提交订单。
 
 前端使用锁定版本的 Node 依赖：
 

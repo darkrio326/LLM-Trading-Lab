@@ -183,10 +183,13 @@ M0/M1/M2 不修改以下策略语义：
 - 非机密 `provider` identity；
 - `place_order(ValidatedOrder)`；
 - `cancel_order(order_reference)`。
+- `query_exact_order` / `query_orders` / `query_trades`；
+- `query_asset` / `query_positions`；
+- broker-neutral order status、order/trade/position/asset models。
 
 `broker_provider = "eastmoney"` 只说明某条 execution fact 实际使用了 upstream 当前 adapter。Eastmoney 不是本项目唯一或长期固定券商；Eastmoney URL、页面、Selenium 和会话细节不得进入 experiment policy、journal 或核心 execution contract。
 
-M0 不实现 GuosenBroker，不接入国信、iQuant、GTrade 或任何其他真实券商。后续 broker integration 必须作为独立范围设计，并重新取得 Owner 对凭据、真实账户和财务 mutation 的明确授权。
+M0 不实现 GuosenBroker，不接入国信、iQuant 或 GTrade。M2 的 `XtpProBroker` 是另行授权的官方股票测试环境 integration，默认只读且不进入 experiment runtime；详细 contract、identifier 和 reconciliation mapping 见 [XTP_PRO.md](XTP_PRO.md)。真实账户和任何财务 mutation 仍需 Owner 对 exact scope 单独明确授权。
 
 ## Execution safety 与状态机
 

@@ -12,7 +12,9 @@
 
 ## 部署后会产生
 
-网页中填写的外部服务配置、券商凭据、账户快照、运行状态和策略归档会写入 Docker 的 `runtime` 或 `archives` 卷。它们不在源码目录中，也不会因重新构建镜像而进入 Git。
+网页中填写的外部服务配置、账户快照、运行状态和策略归档会写入 Docker 的 `runtime` 或 `archives` 卷。它们不在源码目录中，也不会因重新构建镜像而进入 Git。
+
+XTP Pro 测试凭据是更窄的边界：只从仓库外 owner-only private runtime config 读取，不进入 Docker archive、round archive、execution journal、应用日志、PR 或 Project Gate evidence。SDK fatal-only 输出只留在仓库外 private runtime 目录；测试 smoke 不打印账户数据、endpoint、session 或 XTP identifier 值。
 
 浏览器登录态存在于浏览器容器的可写层，重建浏览器容器后可能需要重新登录。不要导出浏览器容器或 profile 并上传到公开仓库。
 

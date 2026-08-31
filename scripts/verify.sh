@@ -23,6 +23,7 @@ cmp "$PROJECT_ROOT/deploy/web.Dockerfile" "$PROJECT_ROOT/source/deploy/web.Docke
 (
   cd "$PROJECT_ROOT/source/backend"
   PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m tests.smoke
+  PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m tests.xtp_pro_adapter
 )
 
 if ! command -v npm >/dev/null 2>&1; then

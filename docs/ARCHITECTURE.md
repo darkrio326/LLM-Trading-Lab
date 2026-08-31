@@ -26,6 +26,8 @@ API 和 daemon 使用同一个后端镜像，但入口命令不同。它们共�
 
 M2 Experiment #1 使用 `experiment` Compose profile。该 profile 的 daemon 直接使用 `MarketCollector` 获取公开行情，并固定为 `AuthorizationKind.SIMULATION`、`broker_provider=None`；它不启动也不依赖 `browser`。上图中的 browser 仅表示公开 compose 中仍保留的 upstream `collector` profile，不属于 M2 runtime。
 
+`XtpProBroker` 是单独的 test-environment adapter，不接入上述默认 daemon/API 构造路径。它只在显式的 credential-gated smoke 中从仓库外 private config 加载官方 SDK，默认 `writes_enabled=False`；`PaperExecutionEngine` 仍与 `BrokerAdapter` 平行且完全隔离。详见 [XTP_PRO.md](XTP_PRO.md)。
+
 `runtime` 命名卷保存私有模型配置、catalog、schedule 与运行状态；`archives` 命名卷保存 round archives、execution journal 和 `ExperimentLedger`。`EXPERIMENT_STARTED` 是 ledger 中的 append-only fact，不是容器状态；API/Web recreate 不会创建新实验或重置 synthetic NAV。
 
 ## 源码与发布产物
